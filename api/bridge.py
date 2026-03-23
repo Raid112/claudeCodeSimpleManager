@@ -43,7 +43,7 @@ class Bridge:
             return None
         result = self._window.create_file_dialog(
             webview.FOLDER_DIALOG,
-            directory="C:\\Users\\caioc",
+            directory=str(Path.home()),
         )
         if result and len(result) > 0:
             folder = result[0]
