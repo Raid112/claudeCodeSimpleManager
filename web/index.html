@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Code Launcher</title>
+    <link rel="stylesheet" href="vendor/xterm.css">
+    <link rel="stylesheet" href="css/theme.css">
+</head>
+<body>
+    <!-- Title Bar -->
+    <div class="title-bar">
+        <h1>⚡ Claude Code Launcher</h1>
+    </div>
+
+    <!-- Main Layout -->
+    <div class="main-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">Grupos</div>
+            <div class="sidebar-groups" id="sidebar-groups"></div>
+            <div class="sidebar-footer">
+                <div class="add-group-btn" id="add-group-btn">
+                    <span>＋</span>
+                    <span>Adicionar grupo</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Terminal Area -->
+        <div class="terminal-area">
+            <!-- Tab Bar -->
+            <div class="tab-bar" id="tab-bar"></div>
+
+            <!-- Terminal Container -->
+            <div class="terminal-container" id="terminal-container">
+                <!-- Welcome Screen -->
+                <div class="welcome" id="welcome">
+                    <div class="welcome-icon">⚡</div>
+                    <div class="welcome-text">Clique <b>+</b> em um grupo para abrir um terminal</div>
+                    <div class="welcome-hint">Cada terminal roda Claude Code no diretório do projeto</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="vendor/xterm.min.js"></script>
+    <script src="vendor/xterm-addon-fit.min.js"></script>
+    <script src="vendor/xterm-addon-web-links.min.js"></script>
+    <script src="js/terminal.js"></script>
+    <script src="js/sidebar.js"></script>
+    <script src="js/tabs.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
