@@ -99,7 +99,13 @@ class TerminalInstance {
         // Load addons
         this.fitAddon = new FitAddon.FitAddon();
         this.term.loadAddon(this.fitAddon);
-        this.term.loadAddon(new WebLinksAddon.WebLinksAddon());
+        this.term.loadAddon(new WebLinksAddon.WebLinksAddon((event, uri) => {
+            if (window.pywebview && window.pywebview.api) {
+                window.pywebview.api.open_url(uri);
+            } else {
+                window.open(uri, '_blank');
+            }
+        }));
 
         // Open terminal in container
         this.term.open(container);

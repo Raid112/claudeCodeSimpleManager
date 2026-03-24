@@ -3,6 +3,7 @@ pywebview JS API bridge — exposes Python functions to JavaScript.
 """
 
 import json
+import webbrowser
 import webview
 from pathlib import Path
 from terminal.pty_manager import PtyManager
@@ -84,3 +85,6 @@ class Bridge:
 
     def get_ws_port(self) -> int:
         return self.ws_server.actual_port
+
+    def open_url(self, url: str):
+        webbrowser.open(url)
