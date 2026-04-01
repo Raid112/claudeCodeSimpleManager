@@ -42,6 +42,10 @@ def main():
     bridge.set_window(window)
 
     def on_closing():
+        try:
+            bridge.save_sessions_from_backend()
+        except Exception:
+            pass
         pty_manager.close_all()
 
     window.events.closing += on_closing

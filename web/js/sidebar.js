@@ -46,7 +46,7 @@ class Sidebar {
                     const isActive = this.app.activeTerminalId === t.id;
                     html += `<div class="terminal-item ${isActive ? 'active' : ''}" data-id="${t.id}">`;
                     html += `<span class="terminal-dot ${dotClass}"></span>`;
-                    html += `<span class="terminal-name">${group.name} #${t.id.slice(0, 4)}</span>`;
+                    html += `<span class="terminal-name" data-id="${t.id}">${this.app.getDisplayName(t.id)}</span>`;
                     html += `</div>`;
                 }
             }
@@ -90,6 +90,46 @@ class Sidebar {
                 this.app.switchToTerminal(el.dataset.id);
             });
         });
+
+        // Right-click on terminal name -> rename
+        this.container.querySelectorAll('.terminal-name').forEach(el => {
+            el.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this._startRename(el, el.dataset.id);
+            });
+        });
+    }
+
+    _startRename(nameEl, sessionId) {
+        const currentName = this.app.getDisplayName(sessionId);
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'sidebar-rename-input';
+        input.value = currentName;
+
+        nameEl.textContent = '';
+        nameEl.appendChild(input);
+        input.focus();
+        input.select();
+
+        const finish = () => {
+            const newName = input.value.trim();
+            this.app.renameTerminal(sessionId, newName || null);
+        };
+
+        input.addEventListener('blur', finish);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                input.blur();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                input.value = '';
+                input.blur();
+            }
+        });
+        input.addEventListener('click', (e) => e.stopPropagation());
     }
 
     _getTerminalStatus(id) {

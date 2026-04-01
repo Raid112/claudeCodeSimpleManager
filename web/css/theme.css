@@ -385,6 +385,27 @@ body {
     background: rgba(239, 68, 68, 0.15);
 }
 
+/* Rename inputs */
+.tab-rename-input,
+.sidebar-rename-input {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    font-size: 12px;
+    font-family: inherit;
+    padding: 1px 4px;
+    outline: none;
+    width: 100%;
+    box-sizing: border-box;
+}
+.tab-rename-input {
+    max-width: 140px;
+}
+.sidebar-rename-input {
+    max-width: 120px;
+}
+
 /* Terminal container */
 .terminal-container {
     flex: 1;

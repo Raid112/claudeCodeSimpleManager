@@ -10,6 +10,7 @@ from terminal.pty_manager import PtyManager
 from terminal.ws_server import WebSocketServer
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+SESSIONS_PATH = Path(__file__).parent.parent / "sessions.json"
 
 
 def _load_config() -> dict:
@@ -22,6 +23,21 @@ def _load_config() -> dict:
 def _save_config(config: dict):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def _load_sessions() -> dict:
+    if SESSIONS_PATH.exists():
+        try:
+            with open(SESSIONS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {"tabs": [], "active_tab_index": 0}
+    return {"tabs": [], "active_tab_index": 0}
+
+
+def _save_sessions(sessions: dict):
+    with open(SESSIONS_PATH, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2, ensure_ascii=False)
 
 
 class Bridge:
@@ -68,8 +84,11 @@ class Bridge:
             if s.group_name == name:
                 self.pty_manager.close_session(s.id)
 
-    def open_terminal(self, group_name: str, path: str, cols: int = 120, rows: int = 30) -> dict:
-        session = self.pty_manager.create_session(group_name, path, cols, rows)
+    def open_terminal(self, group_name: str, path: str, cols: int = 120, rows: int = 30,
+                      continue_session: bool = False, claude_session_id: str = None) -> dict:
+        session = self.pty_manager.create_session(group_name, path, cols, rows,
+                                                  continue_session=continue_session,
+                                                  claude_session_id=claude_session_id)
         return {
             "session_id": session.id,
             "ws_port": self.ws_server.actual_port,
@@ -85,6 +104,26 @@ class Bridge:
 
     def get_ws_port(self) -> int:
         return self.ws_server.actual_port
+
+    def save_sessions(self, tabs: list, active_tab_index: int = 0):
+        _save_sessions({"tabs": tabs, "active_tab_index": active_tab_index})
+
+    def load_sessions(self) -> dict:
+        return _load_sessions()
+
+    def clear_sessions(self):
+        _save_sessions({"tabs": [], "active_tab_index": 0})
+
+    def save_sessions_from_backend(self):
+        tabs = []
+        for i, session in enumerate(self.pty_manager.sessions.values()):
+            tabs.append({
+                "group_name": session.group_name,
+                "path": session.path,
+                "tab_order": i,
+                "claude_session_id": session.claude_session_id,
+            })
+        _save_sessions({"tabs": tabs, "active_tab_index": 0})
 
     def open_url(self, url: str):
         webbrowser.open(url)
