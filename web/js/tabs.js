@@ -15,10 +15,12 @@ class TabBar {
             const isActive = this.app.activeTerminalId === id;
             const dotClass = info.instance.status;  // 'running', 'ready', or 'stopped'
             const displayName = this.app.getDisplayName(id);
+            const timerHtml = this._renderTimer(info.instance);
 
             html += `<div class="tab ${isActive ? 'active' : ''} status-${dotClass}" data-id="${id}">`;
             html += `<span class="tab-dot ${dotClass}"></span>`;
             html += `<span class="tab-label" data-id="${id}">${displayName}</span>`;
+            html += timerHtml;
             html += `<span class="tab-close" data-id="${id}" title="Fechar">×</span>`;
             html += `</div>`;
         }
@@ -27,7 +29,27 @@ class TabBar {
         this._bindEvents();
     }
 
+    _renderTimer(instance) {
+        const ms = instance.cacheRemainingMs;
+        if (ms === null) return '';
+        const urgency = instance.cacheUrgency;
+        let label;
+        if (urgency === 'expired') {
+            label = 'expirado';
+        } else {
+            const totalSec = Math.floor(ms / 1000);
+            const m = Math.floor(totalSec / 60);
+            const s = totalSec % 60;
+            label = m >= 10 ? `${m}m` : `${m}:${String(s).padStart(2, '0')}`;
+        }
+        const title = urgency === 'expired'
+            ? 'Cache expirado — envie qualquer coisa para renovar'
+            : `Cache renova em ${label}`;
+        return `<span class="cache-timer ${urgency}" title="${title}">${label}</span>`;
+    }
+
     _startRename(labelEl, sessionId) {
+        this.app._isRenaming = true;
         const currentName = this.app.getDisplayName(sessionId);
         const input = document.createElement('input');
         input.type = 'text';

@@ -82,8 +82,29 @@ class TerminalInstance {
         this.ws = null;
         this.alive = true;
         this.lastOutputTime = Date.now();
-        this._recentOutput = '';          // rolling buffer of recent output (last ~5000 chars)
+
+        // Ring buffer of recent output chunks (cheap append, O(1) eviction).
+        // Concatenated only when classification needs it.
+        this._recentChunks = [];
+        this._recentChunksSize = 0;
+        this._RECENT_LIMIT = 5000;
+
+        // Cached classification (recomputed on new output, not on every status read).
+        this._cachedIdleStatus = 'ready';
+        this._cachedIdleStale = true;
+
         this._previousStatus = 'running'; // track transitions for sound
+
+        // Explicit follow-mode state. true = output rolls to bottom; false = user is reading scrollback.
+        // Transitions: user scrolls up → false. User clicks ↓ btn or buffer reaches genuine bottom → true.
+        this.autoFollow = true;
+        this._suppressScrollEvent = false; // ignore programmatic scrollToBottom in onScroll handler
+        this._lastBaseY = 0;
+
+        // Time of last user-originated message — drives the 1h cache countdown shown on the tab.
+        // Set by Composer._send and by direct \r input here (filtered by status).
+        // null = no message sent yet; timer hidden.
+        this.lastUserMessageTime = null;
 
         // Create xterm.js terminal
         this.term = new Terminal({
@@ -128,13 +149,24 @@ class TerminalInstance {
         this._scrollBtn.title = 'Ir para o final';
         this._scrollBtn.style.display = 'none';
         this._scrollBtn.addEventListener('click', () => {
-            this.term.scrollToBottom();
+            this.autoFollow = true;
+            this._scrollToBottomProgrammatic();
             this.term.focus();
+            this._updateScrollBtn();
         });
         container.appendChild(this._scrollBtn);
 
-        // Show/hide scroll button based on viewport position
-        this.term.onScroll(() => this._updateScrollBtn());
+        // Detect manual scroll to toggle autoFollow off; re-enable only when user reaches genuine bottom.
+        this.term.onScroll(() => {
+            if (this._suppressScrollEvent) return;
+            const buf = this.term.buffer.active;
+            if (buf.viewportY < buf.baseY) {
+                this.autoFollow = false;
+            } else if (buf.viewportY === buf.baseY) {
+                this.autoFollow = true;
+            }
+            this._updateScrollBtn();
+        });
         this.term.onLineFeed(() => this._updateScrollBtn());
 
         // Connect WebSocket
@@ -159,12 +191,16 @@ class TerminalInstance {
             return true;
         });
 
-        // Handle input -> send to PTY (and snap viewport to bottom)
+        // Handle input -> send to PTY. Do NOT force scroll here; autoFollow controls following.
         this.term.onData((data) => {
             if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                 this.ws.send(data);
             }
-            this.term.scrollToBottom();
+            // Reset cache timer on Enter, but only if NOT confirming a tool-use prompt.
+            // Tool-use 'y'/'n' + Enter shouldn't be treated as a chat turn.
+            if (data.includes('\r') && this._previousStatus !== 'tooluse') {
+                this.lastUserMessageTime = Date.now();
+            }
         });
 
         // Handle resize
@@ -181,16 +217,14 @@ class TerminalInstance {
         this.ws.onmessage = (event) => {
             this.lastOutputTime = Date.now();
             this.term.write(event.data);
-            // Append to rolling buffer, keep last 5000 chars
-            this._recentOutput += event.data;
-            if (this._recentOutput.length > 5000) {
-                this._recentOutput = this._recentOutput.slice(-5000);
-            }
-            // Auto-scroll to bottom if user is near the bottom (within 5 rows)
-            const buf = this.term.buffer.active;
-            const viewportAtBottom = buf.viewportY >= buf.baseY - 5;
-            if (viewportAtBottom) {
-                this.term.scrollToBottom();
+            this._appendRecent(event.data);
+            this._cachedIdleStale = true;
+
+            // Follow only when explicitly in follow mode. No threshold heuristics.
+            if (this.autoFollow) {
+                this._scrollToBottomProgrammatic();
+            } else {
+                this._updateScrollBtn();
             }
         };
 
@@ -230,10 +264,33 @@ class TerminalInstance {
         return newStatus;
     }
 
+    /** Append output chunk to ring buffer; O(1) eviction by chunk. */
+    _appendRecent(data) {
+        this._recentChunks.push(data);
+        this._recentChunksSize += data.length;
+        while (this._recentChunksSize > this._RECENT_LIMIT && this._recentChunks.length > 1) {
+            this._recentChunksSize -= this._recentChunks.shift().length;
+        }
+    }
+
+    /** Programmatic scroll to bottom that does not flip autoFollow back on via onScroll. */
+    _scrollToBottomProgrammatic() {
+        this._suppressScrollEvent = true;
+        try {
+            this.term.scrollToBottom();
+        } finally {
+            // Restore on next tick — onScroll fires sync inside scrollToBottom in current xterm versions
+            setTimeout(() => { this._suppressScrollEvent = false; }, 0);
+        }
+    }
+
     /** Analyze recent terminal output to distinguish tool-use request from chat completion. */
     _classifyIdleStatus() {
+        if (!this._cachedIdleStale) return this._cachedIdleStatus;
+
+        const recent = this._recentChunks.join('');
         // Strip ANSI escape sequences for analysis
-        const clean = this._recentOutput.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+        const clean = recent.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
         const lastChunk = clean.slice(-2000);
 
         // Tool-use patterns: Claude Code asks for permission before executing tools
@@ -250,19 +307,40 @@ class TerminalInstance {
             />\s*1\.\s*Yes/,
         ];
 
+        let result = 'ready';
         for (const pattern of toolUsePatterns) {
             if (pattern.test(lastChunk)) {
-                return 'tooluse';
+                result = 'tooluse';
+                break;
             }
         }
-
-        return 'ready';
+        this._cachedIdleStatus = result;
+        this._cachedIdleStale = false;
+        return result;
     }
 
     _updateScrollBtn() {
-        const buf = this.term.buffer.active;
-        const isAtBottom = buf.viewportY >= buf.baseY - 2;
-        this._scrollBtn.style.display = isAtBottom ? 'none' : 'block';
+        this._scrollBtn.style.display = this.autoFollow ? 'none' : 'block';
+    }
+
+    /**
+     * Cache remaining time, in ms. Anthropic prompt-cache extended TTL is 1h.
+     * Returns null if no user message has been sent yet (timer hidden).
+     */
+    get cacheRemainingMs() {
+        if (!this.lastUserMessageTime) return null;
+        const TTL_MS = 60 * 60 * 1000;
+        return TTL_MS - (Date.now() - this.lastUserMessageTime);
+    }
+
+    /** 'fresh' (>30m) | 'warn' (10-30m) | 'critical' (0-10m) | 'expired' (<=0) | null */
+    get cacheUrgency() {
+        const ms = this.cacheRemainingMs;
+        if (ms === null) return null;
+        if (ms <= 0) return 'expired';
+        if (ms <= 10 * 60 * 1000) return 'critical';
+        if (ms <= 30 * 60 * 1000) return 'warn';
+        return 'fresh';
     }
 
     fit() {

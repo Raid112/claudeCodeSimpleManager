@@ -7,11 +7,16 @@ class Sidebar {
         this.container = container;
         this.app = app;
         this.expandedGroups = new Set();
+        this._terminalType = 'claude';
     }
 
     async render() {
         const groups = await window.pywebview.api.get_groups();
         const terminals = await window.pywebview.api.get_terminals();
+
+        try {
+            this._terminalType = await window.pywebview.api.get_terminal_type();
+        } catch (e) {}
 
         let html = '';
 
@@ -55,6 +60,7 @@ class Sidebar {
         }
 
         this.container.innerHTML = html;
+        this._renderTypeSelector();
         this._bindEvents();
     }
 
@@ -102,6 +108,7 @@ class Sidebar {
     }
 
     _startRename(nameEl, sessionId) {
+        this.app._isRenaming = true;
         const currentName = this.app.getDisplayName(sessionId);
         const input = document.createElement('input');
         input.type = 'text';
@@ -130,6 +137,31 @@ class Sidebar {
             }
         });
         input.addEventListener('click', (e) => e.stopPropagation());
+    }
+
+    _renderTypeSelector() {
+        const footer = this.container.parentElement.querySelector('.sidebar-footer');
+        let selector = footer.querySelector('.terminal-type-selector');
+        if (!selector) {
+            selector = document.createElement('div');
+            selector.className = 'terminal-type-selector';
+            selector.innerHTML = `
+                <label class="terminal-type-label">Tipo de terminal</label>
+                <select id="terminal-type-select" class="terminal-type-select">
+                    <option value="claude">Claude Code</option>
+                    <option value="codex">Codex</option>
+                    <option value="opencode">OpenCode</option>
+                    <option value="powershell">PowerShell</option>
+                </select>
+            `;
+            footer.insertBefore(selector, footer.firstChild);
+        }
+        const select = selector.querySelector('select');
+        select.value = this._terminalType;
+        select.onchange = async () => {
+            this._terminalType = select.value;
+            await window.pywebview.api.set_terminal_type(select.value);
+        };
     }
 
     _getTerminalStatus(id) {

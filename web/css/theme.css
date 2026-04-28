@@ -260,6 +260,56 @@ body {
     border-top: 1px solid var(--border-dim);
 }
 
+.terminal-type-selector {
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-dim);
+}
+
+.terminal-type-label {
+    display: block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+}
+
+.terminal-type-select {
+    width: 100%;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-dim);
+    border-radius: 4px;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.15s;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    padding-right: 24px;
+}
+
+.terminal-type-select:hover {
+    border-color: var(--accent);
+}
+
+.terminal-type-select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 6px rgba(168, 85, 247, 0.3);
+}
+
+.terminal-type-select option {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+}
+
 .add-group-btn {
     display: flex;
     align-items: center;
@@ -371,6 +421,43 @@ body {
     box-shadow: 0 0 4px var(--status-stopped);
 }
 
+.cache-timer {
+    font-size: 9px;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 8px;
+    letter-spacing: 0.3px;
+    border: 1px solid transparent;
+    transition: color 0.3s, border-color 0.3s, box-shadow 0.3s;
+}
+.cache-timer.fresh {
+    color: var(--status-ready);
+    border-color: rgba(0, 255, 136, 0.3);
+}
+.cache-timer.warn {
+    color: var(--status-tooluse);
+    border-color: rgba(255, 170, 0, 0.4);
+    box-shadow: 0 0 4px rgba(255, 170, 0, 0.2);
+}
+.cache-timer.critical {
+    color: var(--danger);
+    border-color: rgba(239, 68, 68, 0.5);
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.3);
+    animation: cache-pulse 1.8s ease-in-out infinite;
+}
+.cache-timer.expired {
+    color: var(--text-dim);
+    border-color: var(--border-dim);
+    text-decoration: line-through;
+    opacity: 0.7;
+}
+
+@keyframes cache-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+
 .tab .tab-close {
     font-size: 14px;
     color: var(--text-dim);
@@ -406,10 +493,217 @@ body {
     max-width: 120px;
 }
 
-/* Terminal container */
-.terminal-container {
+/* Split area: terminal pane (top) + splitter + composer pane (bottom) */
+.split-area {
     flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.terminal-pane {
+    flex: 0 0 auto;
+    flex-basis: 60%;
+    min-height: 120px;
     position: relative;
+    overflow: hidden;
+    /* Promote to its own compositor layer — mitigates WebView2 scrollbar/render glitches */
+    transform: translateZ(0);
+    will-change: transform;
+}
+
+.pane-splitter {
+    flex: 0 0 6px;
+    height: 6px;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border-dim);
+    border-bottom: 1px solid var(--border-dim);
+    cursor: row-resize;
+    user-select: none;
+    transition: background 0.15s;
+    position: relative;
+}
+.pane-splitter:hover,
+.pane-splitter.dragging {
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(168, 85, 247, 0.5);
+}
+.pane-splitter.collapsed-handle {
+    cursor: pointer;
+    flex: 0 0 18px;
+    height: 18px;
+    background: linear-gradient(180deg, var(--bg-tertiary), var(--bg-secondary));
+    border-top: 1px solid var(--accent);
+    border-bottom: 1px solid var(--border-dim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 5;
+}
+.pane-splitter.collapsed-handle::before {
+    content: '↑ Mostrar composer (Ctrl+\\)';
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.5px;
+    text-shadow: 0 0 6px rgba(168, 85, 247, 0.4);
+}
+.pane-splitter.collapsed-handle::after {
+    display: none;
+}
+.pane-splitter.collapsed-handle:hover {
+    background: var(--bg-hover);
+}
+.pane-splitter.collapsed-handle:hover::before {
+    color: var(--accent-glow);
+    text-shadow: 0 0 10px rgba(168, 85, 247, 0.7);
+}
+.pane-splitter::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 32px;
+    height: 2px;
+    background: var(--text-dim);
+    border-radius: 1px;
+    opacity: 0.5;
+}
+
+.composer-pane {
+    flex: 1 1 auto;
+    min-height: 0;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border-dim);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.composer-pane.collapsed {
+    display: none;
+}
+
+.composer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-dim);
+    font-size: 10px;
+    flex-shrink: 0;
+}
+
+.composer-target {
+    color: var(--accent);
+    font-weight: 600;
+    text-shadow: 0 0 6px rgba(168, 85, 247, 0.4);
+    letter-spacing: 0.3px;
+}
+.composer-target.tooluse {
+    color: var(--status-tooluse);
+    text-shadow: 0 0 6px rgba(255, 170, 0, 0.4);
+}
+.composer-target.stopped {
+    color: var(--text-dim);
+    text-shadow: none;
+}
+
+.composer-hint {
+    color: var(--text-dim);
+    font-size: 10px;
+}
+.composer-hint kbd {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-dim);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 9px;
+    color: var(--text-secondary);
+}
+
+.composer-textarea {
+    flex: 1;
+    width: 100%;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: none;
+    padding: 10px 12px;
+    font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+    overflow-y: auto;
+    box-sizing: border-box;
+}
+.composer-textarea::placeholder {
+    color: var(--text-dim);
+    opacity: 0.6;
+}
+.composer-textarea:focus {
+    box-shadow: inset 0 0 0 1px var(--accent);
+}
+.composer-textarea:disabled {
+    background: var(--bg-secondary);
+    color: var(--text-dim);
+    cursor: not-allowed;
+}
+.composer-textarea::-webkit-scrollbar {
+    width: 6px;
+}
+.composer-textarea::-webkit-scrollbar-thumb {
+    background: var(--border-dim);
+    border-radius: 3px;
+}
+
+.composer-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    border-top: 1px solid var(--border-dim);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+}
+
+.composer-status {
+    font-size: 10px;
+    color: var(--text-dim);
+}
+.composer-status.warn {
+    color: var(--status-tooluse);
+    text-shadow: 0 0 6px rgba(255, 170, 0, 0.3);
+}
+
+.composer-send-btn {
+    background: var(--accent);
+    color: var(--bg-primary);
+    border: none;
+    padding: 5px 14px;
+    font-size: 11px;
+    font-weight: 700;
+    font-family: inherit;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, box-shadow 0.15s, opacity 0.15s;
+    letter-spacing: 0.5px;
+}
+.composer-send-btn:hover:not(:disabled) {
+    background: var(--accent-glow);
+    box-shadow: 0 0 10px rgba(168, 85, 247, 0.6);
+}
+.composer-send-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* Terminal container — now lives inside .terminal-pane */
+.terminal-container {
+    position: absolute;
+    inset: 0;
     overflow: hidden;
 }
 
@@ -417,9 +711,17 @@ body {
     position: absolute;
     inset: 0;
     display: none;
+    /* Force own compositor layer — separates xterm canvas from parent reflow */
+    transform: translateZ(0);
 }
 .terminal-wrapper.active {
     display: block;
+}
+
+/* While dragging the splitter, disable pointer events on the panes so iframes/canvases don't steal mouse */
+.split-area.resizing .terminal-pane,
+.split-area.resizing .composer-pane {
+    pointer-events: none;
 }
 
 /* Welcome screen */

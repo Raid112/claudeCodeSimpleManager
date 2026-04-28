@@ -13,11 +13,22 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 SESSIONS_PATH = Path(__file__).parent.parent / "sessions.json"
 
 
+DEFAULT_LAYOUT = {"split_ratio": 0.6, "composer_collapsed": False}
+
+
 def _load_config() -> dict:
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"groups": []}
+            config = json.load(f)
+    else:
+        config = {"terminal_type": "claude", "groups": []}
+    # Backfill defaults for forward-compat
+    if "layout" not in config:
+        config["layout"] = dict(DEFAULT_LAYOUT)
+    else:
+        for k, v in DEFAULT_LAYOUT.items():
+            config["layout"].setdefault(k, v)
+    return config
 
 
 def _save_config(config: dict):
@@ -55,6 +66,41 @@ class Bridge:
         config = _load_config()
         return config.get("groups", [])
 
+    def get_terminal_type(self) -> str:
+        config = _load_config()
+        return config.get("terminal_type", "claude")
+
+    def set_terminal_type(self, terminal_type: str):
+        config = _load_config()
+        config["terminal_type"] = terminal_type
+        _save_config(config)
+
+    def get_layout(self) -> dict:
+        config = _load_config()
+        return config.get("layout", dict(DEFAULT_LAYOUT))
+
+    def set_layout(self, layout: dict):
+        config = _load_config()
+        current = config.get("layout", dict(DEFAULT_LAYOUT))
+        if "split_ratio" in layout:
+            ratio = float(layout["split_ratio"])
+            current["split_ratio"] = max(0.1, min(0.95, ratio))
+        if "composer_collapsed" in layout:
+            current["composer_collapsed"] = bool(layout["composer_collapsed"])
+        config["layout"] = current
+        _save_config(config)
+
+    def get_composer_history(self) -> list:
+        config = _load_config()
+        return config.get("composer_history", [])
+
+    def set_composer_history(self, history: list):
+        config = _load_config()
+        # Cap at 50 most recent
+        if isinstance(history, list):
+            config["composer_history"] = [str(x) for x in history[-50:]]
+        _save_config(config)
+
     def add_group(self) -> dict | None:
         if not self._window:
             return None
@@ -84,16 +130,33 @@ class Bridge:
             if s.group_name == name:
                 self.pty_manager.close_session(s.id)
 
-    def open_terminal(self, group_name: str, path: str, cols: int = 120, rows: int = 30,
-                      continue_session: bool = False, claude_session_id: str = None) -> dict:
-        session = self.pty_manager.create_session(group_name, path, cols, rows,
-                                                  continue_session=continue_session,
-                                                  claude_session_id=claude_session_id)
+    def open_terminal(
+        self,
+        group_name: str,
+        path: str,
+        cols: int = 120,
+        rows: int = 30,
+        terminal_type: str = None,
+        continue_session: bool = False,
+        claude_session_id: str = None,
+    ) -> dict:
+        if terminal_type is None:
+            terminal_type = self.get_terminal_type()
+        session = self.pty_manager.create_session(
+            group_name,
+            path,
+            cols,
+            rows,
+            terminal_type=terminal_type,
+            continue_session=continue_session,
+            claude_session_id=claude_session_id,
+        )
         return {
             "session_id": session.id,
             "ws_port": self.ws_server.actual_port,
             "group_name": group_name,
             "path": path,
+            "terminal_type": terminal_type,
         }
 
     def close_terminal(self, session_id: str):
@@ -117,12 +180,15 @@ class Bridge:
     def save_sessions_from_backend(self):
         tabs = []
         for i, session in enumerate(self.pty_manager.sessions.values()):
-            tabs.append({
-                "group_name": session.group_name,
-                "path": session.path,
-                "tab_order": i,
-                "claude_session_id": session.claude_session_id,
-            })
+            tabs.append(
+                {
+                    "group_name": session.group_name,
+                    "path": session.path,
+                    "tab_order": i,
+                    "claude_session_id": session.claude_session_id,
+                    "terminal_type": session.terminal_type,
+                }
+            )
         _save_sessions({"tabs": tabs, "active_tab_index": 0})
 
     def open_url(self, url: str):

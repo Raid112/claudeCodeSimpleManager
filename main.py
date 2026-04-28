@@ -43,6 +43,8 @@ def main():
 
     def on_closing():
         try:
+            # Wait for session ID detection threads before saving
+            pty_manager.wait_for_detection(timeout=3.0)
             bridge.save_sessions_from_backend()
         except Exception:
             pass

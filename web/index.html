@@ -32,13 +32,43 @@
             <!-- Tab Bar -->
             <div class="tab-bar" id="tab-bar"></div>
 
-            <!-- Terminal Container -->
-            <div class="terminal-container" id="terminal-container">
-                <!-- Welcome Screen -->
-                <div class="welcome" id="welcome">
-                    <div class="welcome-icon">⚡</div>
-                    <div class="welcome-text">Clique <b>+</b> em um grupo para abrir um terminal</div>
-                    <div class="welcome-hint">Cada terminal roda Claude Code no diretório do projeto</div>
+            <!-- Split: terminal pane (top) + composer pane (bottom) -->
+            <div class="split-area" id="split-area">
+                <!-- Terminal Container -->
+                <div class="terminal-pane" id="terminal-pane">
+                    <div class="terminal-container" id="terminal-container">
+                        <!-- Welcome Screen -->
+                        <div class="welcome" id="welcome">
+                            <div class="welcome-icon">⚡</div>
+                            <div class="welcome-text">Clique <b>+</b> em um grupo para abrir um terminal</div>
+                            <div class="welcome-hint">Cada terminal roda no diretório do projeto (tipo configurado na sidebar)</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Drag handle -->
+                <div class="pane-splitter" id="pane-splitter" title="Arraste para redimensionar"></div>
+
+                <!-- Composer pane: format-aware message input -->
+                <div class="composer-pane" id="composer-pane">
+                    <div class="composer-header">
+                        <span class="composer-target" id="composer-target">Sem terminal ativo</span>
+                        <span class="composer-hint">
+                            <kbd>Enter</kbd> enviar &nbsp;·&nbsp;
+                            <kbd>Shift</kbd>+<kbd>Enter</kbd> nova linha &nbsp;·&nbsp;
+                            <kbd>↑</kbd>/<kbd>↓</kbd> histórico
+                        </span>
+                    </div>
+                    <textarea
+                        id="composer-textarea"
+                        class="composer-textarea"
+                        placeholder="Escreva sua mensagem... (Enter envia, Shift+Enter quebra linha)"
+                        spellcheck="false"
+                        rows="3"></textarea>
+                    <div class="composer-footer">
+                        <span class="composer-status" id="composer-status"></span>
+                        <button class="composer-send-btn" id="composer-send-btn" title="Enviar (Enter)">Enviar ↵</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -51,6 +81,7 @@
     <script src="js/terminal.js"></script>
     <script src="js/sidebar.js"></script>
     <script src="js/tabs.js"></script>
+    <script src="js/composer.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

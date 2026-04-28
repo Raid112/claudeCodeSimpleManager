@@ -20,3 +20,6 @@ Desktop.ini
 
 # Config with local paths
 config.json
+
+# Runtime session state
+sessions.json
