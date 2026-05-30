@@ -289,6 +289,9 @@ class App {
                 if (serverData.terminal_type && !info.terminalType) {
                     info.terminalType = serverData.terminal_type;
                 }
+                // Authoritative hook state (claude only; null otherwise).
+                info.instance.backendState = serverData.state || null;
+                this._maybePlayStateSound(info.instance, serverData.state, serverData.state_ts);
             }
         }
 
@@ -299,6 +302,28 @@ class App {
         this.tabBar.render();
         await this.sidebar.render();
         if (this.composer) this.composer.refreshTarget();
+    }
+
+    /**
+     * Edge-trigger transition sounds from the authoritative hook state.
+     * Driven by state_ts (each hook event bumps it) so it fires once per real
+     * transition, not once per 2s poll. First observation sets a baseline with
+     * no sound, so restoring sessions with pre-existing state stays silent.
+     */
+    _maybePlayStateSound(instance, state, stateTs) {
+        const ts = stateTs || 0;
+        if (instance._lastStateTs === undefined) {
+            instance._lastStateTs = ts;
+            return;
+        }
+        if (ts > instance._lastStateTs) {
+            instance._lastStateTs = ts;
+            if (state === 'ready') {
+                TerminalInstance.playReadySound();
+            } else if (state === 'tooluse' || state === 'waiting') {
+                TerminalInstance.playToolUseSound();
+            }
+        }
     }
 
     async _restoreSessions() {

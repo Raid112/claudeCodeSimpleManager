@@ -117,11 +117,12 @@ class Composer {
             return;
         }
 
-        // Convert any local CRLF/CR to LF first, then convert each LF to \r (PTYs use CR for "Enter").
-        // For multi-line: send all lines joined by \r so the agent receives one message with literal newlines
-        // — Claude Code uses \r as message-end; embedded \n keeps line breaks within the message.
-        const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        ws.send(normalized + '\r');
+        // Use the same terminal input contract as direct paste.
+        // Bracketed paste is used automatically when the active terminal supports it.
+        if (!info.instance.sendComposerText(text)) {
+            this._flashStatus('Falha ao enviar para o terminal', true);
+            return;
+        }
 
         // Push to history (no consecutive duplicates)
         if (this.history[this.history.length - 1] !== text) {
@@ -137,9 +138,6 @@ class Composer {
 
         // Re-focus the textarea (don't yank focus to terminal)
         this.textareaEl.focus();
-
-        // Mark user-message time on the terminal — used by Phase 4 cache timer
-        info.instance.lastUserMessageTime = Date.now();
     }
 
     _flashStatus(text, isWarn) {
@@ -186,6 +184,16 @@ class Composer {
             this.targetEl.className = 'composer-target tooluse';
             this.textareaEl.disabled = true;
             this.sendBtnEl.disabled = true;
+            return;
+        }
+
+        // 'waiting' = claude is idle waiting for your input — keep composer usable,
+        // just hint at it. (Distinct from 'tooluse', which you answer in the terminal.)
+        if (status === 'waiting') {
+            this.targetEl.textContent = `→ ${name} (aguardando você)`;
+            this.targetEl.className = 'composer-target waiting';
+            this.textareaEl.disabled = false;
+            this.sendBtnEl.disabled = false;
             return;
         }
 

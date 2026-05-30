@@ -7,6 +7,7 @@ import json
 import threading
 import websockets
 
+from terminal.input_debug import log_input_boundary
 from terminal.pty_manager import PtyManager
 
 
@@ -76,6 +77,7 @@ class WebSocketServer:
             try:
                 data = session.read()
                 if data:
+                    log_input_boundary("pty->ws", data, session_id=session.id)
                     await websocket.send(data)
                 else:
                     await asyncio.sleep(0.01)
@@ -92,6 +94,8 @@ class WebSocketServer:
                     if msg.get("type") == "resize":
                         session.resize(msg["cols"], msg["rows"])
                         continue
-                session.write(message if isinstance(message, str) else message.decode())
+                text = message if isinstance(message, str) else message.decode()
+                log_input_boundary("ws->pty", text, session_id=session.id)
+                session.write(text)
             except Exception:
                 break

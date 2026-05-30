@@ -35,7 +35,11 @@ class Sidebar {
             if (totalCount > 0) {
                 const hasRunning = groupTerminals.some(t => this._getTerminalStatus(t.id) === 'running');
                 const hasToolUse = groupTerminals.some(t => this._getTerminalStatus(t.id) === 'tooluse');
-                const badgeClass = hasRunning ? 'active' : (hasToolUse ? 'tooluse' : (activeCount > 0 ? 'ready' : 'stopped'));
+                const hasWaiting = groupTerminals.some(t => this._getTerminalStatus(t.id) === 'waiting');
+                const badgeClass = hasRunning ? 'active'
+                    : (hasToolUse ? 'tooluse'
+                    : (hasWaiting ? 'waiting'
+                    : (activeCount > 0 ? 'ready' : 'stopped')));
                 html += `<span class="group-badge ${badgeClass}">${totalCount}</span>`;
             }
 

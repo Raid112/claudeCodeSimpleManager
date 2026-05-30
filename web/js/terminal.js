@@ -93,7 +93,10 @@ class TerminalInstance {
         this._cachedIdleStatus = 'ready';
         this._cachedIdleStale = true;
 
-        this._previousStatus = 'running'; // track transitions for sound
+        // Authoritative state pushed from backend hooks (claude only). null until
+        // the first hook event fires; while null we fall back to output heuristics.
+        // Set by App.refreshStatus from get_terminals().state.
+        this.backendState = null;
 
         // Explicit follow-mode state. true = output rolls to bottom; false = user is reading scrollback.
         // Transitions: user scrolls up → false. User clicks ↓ btn or buffer reaches genuine bottom → true.
@@ -178,9 +181,7 @@ class TerminalInstance {
             if (ev.ctrlKey && ev.key === 'v') {
                 ev.preventDefault();
                 navigator.clipboard.readText().then((text) => {
-                    if (text && this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(text);
-                    }
+                    if (text) this.sendPaste(text);
                 });
                 return false; // prevent xterm from sending \x16
             }
@@ -198,7 +199,7 @@ class TerminalInstance {
             }
             // Reset cache timer on Enter, but only if NOT confirming a tool-use prompt.
             // Tool-use 'y'/'n' + Enter shouldn't be treated as a chat turn.
-            if (data.includes('\r') && this._previousStatus !== 'tooluse') {
+            if (data.includes('\r') && this.status !== 'tooluse') {
                 this.lastUserMessageTime = Date.now();
             }
         });
@@ -209,6 +210,29 @@ class TerminalInstance {
                 this.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
             }
         });
+    }
+
+    get bracketedPasteModeEnabled() {
+        return !!this.term?.modes?.bracketedPasteMode;
+    }
+
+    sendPaste(text) {
+        if (!text || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        const payload = TerminalInput.prepareTerminalPaste(text, {
+            bracketedPasteMode: this.bracketedPasteModeEnabled,
+        });
+        this.ws.send(payload);
+        return true;
+    }
+
+    sendComposerText(text) {
+        if (!text || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+        const payload = TerminalInput.prepareComposerMessage(text, {
+            bracketedPasteMode: this.bracketedPasteModeEnabled,
+        });
+        this.ws.send(payload);
+        this.lastUserMessageTime = Date.now();
+        return true;
     }
 
     _connectWs(wsPort) {
@@ -240,28 +264,24 @@ class TerminalInstance {
     }
 
     /**
-     * Returns status: 'running' | 'ready' | 'tooluse' | 'stopped'.
-     * 'tooluse' = Claude is waiting for tool-use approval.
-     * 'ready' = Claude finished responding (idle at prompt).
+     * Returns status: 'running' | 'ready' | 'tooluse' | 'waiting' | 'stopped'.
+     * 'tooluse'  = waiting for tool-use permission (composer blocked; answer in terminal).
+     * 'waiting'  = idle, waiting for your input (composer free).
+     * 'ready'    = finished responding (idle at prompt).
+     *
+     * For claude with hooks, backendState is authoritative the moment it exists.
+     * Otherwise (opencode/codex, or claude before the first hook event) we fall
+     * back to the output-text heuristic with a 3s debounce.
+     * Sound on transitions is handled in App.refreshStatus, not here — this getter
+     * is read multiple times per poll and must stay side-effect free.
      */
     get status() {
         if (!this.alive) return 'stopped';
+        if (this.backendState) return this.backendState;
+
         const idleMs = Date.now() - this.lastOutputTime;
         if (idleMs < 3000) return 'running';
-
-        // Classify idle state by analyzing recent output
-        const newStatus = this._classifyIdleStatus();
-
-        // Play sound on transition from running -> ready/tooluse
-        if (this._previousStatus === 'running' && newStatus !== 'running') {
-            if (newStatus === 'ready') {
-                TerminalInstance.playReadySound();
-            } else if (newStatus === 'tooluse') {
-                TerminalInstance.playToolUseSound();
-            }
-        }
-        this._previousStatus = newStatus;
-        return newStatus;
+        return this._classifyIdleStatus();
     }
 
     /** Append output chunk to ring buffer; O(1) eviction by chunk. */

@@ -17,6 +17,7 @@
     --status-active: #00d4ff;
     --status-ready: #00ff88;
     --status-tooluse: #ffaa00;
+    --status-waiting: #c084fc;
     --status-stopped: #585b70;
     --glow: 0 0 8px rgba(147, 51, 234, 0.6), 0 0 20px rgba(147, 51, 234, 0.2);
     --glow-strong: 0 0 10px rgba(168, 85, 247, 0.8), 0 0 30px rgba(147, 51, 234, 0.4);
@@ -160,6 +161,10 @@ body {
     background: var(--status-tooluse);
     color: var(--bg-primary);
 }
+.group-badge.waiting {
+    background: var(--status-waiting);
+    color: var(--bg-primary);
+}
 .group-badge.stopped {
     background: var(--status-stopped);
     color: var(--bg-primary);
@@ -226,6 +231,12 @@ body {
     background: var(--status-tooluse);
     border-color: var(--status-tooluse);
     box-shadow: 0 0 8px var(--status-tooluse), 0 0 16px rgba(255, 170, 0, 0.4);
+    animation: tooluse-pulse 1.5s ease-in-out infinite;
+}
+.terminal-dot.waiting {
+    background: var(--status-waiting);
+    border-color: var(--status-waiting);
+    box-shadow: 0 0 8px var(--status-waiting), 0 0 16px rgba(192, 132, 252, 0.4);
     animation: tooluse-pulse 1.5s ease-in-out infinite;
 }
 .terminal-dot.stopped {
@@ -386,6 +397,10 @@ body {
     border-bottom-color: var(--status-tooluse);
     box-shadow: 0 2px 8px rgba(255, 170, 0, 0.3);
 }
+.tab.active.status-waiting {
+    border-bottom-color: var(--status-waiting);
+    box-shadow: 0 2px 8px rgba(192, 132, 252, 0.3);
+}
 .tab.active.status-stopped {
     border-bottom-color: var(--status-stopped);
     box-shadow: 0 2px 8px rgba(88, 91, 112, 0.3);
@@ -413,6 +428,12 @@ body {
     background: var(--status-tooluse);
     border-color: var(--status-tooluse);
     box-shadow: 0 0 6px var(--status-tooluse), 0 0 14px rgba(255, 170, 0, 0.3);
+    animation: tooluse-pulse 1.5s ease-in-out infinite;
+}
+.tab .tab-dot.waiting {
+    background: var(--status-waiting);
+    border-color: var(--status-waiting);
+    box-shadow: 0 0 6px var(--status-waiting), 0 0 14px rgba(192, 132, 252, 0.3);
     animation: tooluse-pulse 1.5s ease-in-out infinite;
 }
 .tab .tab-dot.stopped {
@@ -604,6 +625,10 @@ body {
 .composer-target.tooluse {
     color: var(--status-tooluse);
     text-shadow: 0 0 6px rgba(255, 170, 0, 0.4);
+}
+.composer-target.waiting {
+    color: var(--status-waiting);
+    text-shadow: 0 0 6px rgba(192, 132, 252, 0.4);
 }
 .composer-target.stopped {
     color: var(--text-dim);
