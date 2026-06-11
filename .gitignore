@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 *.spec
+!ClaudeCodeLauncher.spec
 
 # Virtual environments
 venv/

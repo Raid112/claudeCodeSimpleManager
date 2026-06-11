@@ -58,9 +58,49 @@ class Bridge:
         self.pty_manager = pty_manager
         self.ws_server = ws_server
         self._window: webview.Window | None = None
+        self._toaster = None  # lazily created WindowsToaster (windows_toasts)
 
     def set_window(self, window: webview.Window):
         self._window = window
+
+    def notify_state(self, session_id: str, tab_name: str, state: str):
+        """Show a Windows toast for a backgrounded session transition.
+
+        Called from the frontend only when the window is unfocused (see
+        app.js _maybePlayStateSound). Clicking the toast brings the window
+        forward and switches to the originating tab. Best-effort: a missing
+        windows_toasts dependency or any toast error must never break the app.
+        """
+        try:
+            from windows_toasts import WindowsToaster, Toast
+
+            if self._toaster is None:
+                self._toaster = WindowsToaster("Claude Manager")
+
+            title = "Sessão pronta" if state == "ready" else "Aguardando permissão"
+            toast = Toast()
+            toast.text_fields = [title, tab_name or "Claude"]
+            toast.on_activated = lambda _args=None, sid=session_id: self._focus_tab(sid)
+            self._toaster.show_toast(toast)
+        except Exception as e:
+            print(f"notify_state failed (toast skipped): {e}")
+
+    def _focus_tab(self, session_id: str):
+        """Bring the window to the foreground and select the given tab.
+
+        Runs on the windows_toasts activation thread. The on_top toggle is the
+        standard pywebview trick to force the window to the foreground on Windows.
+        """
+        win = self._window
+        if win is None:
+            return
+        try:
+            win.restore()
+            win.on_top = True
+            win.on_top = False
+            win.evaluate_js(f"window.app && window.app.switchToTerminal({json.dumps(session_id)})")
+        except Exception as e:
+            print(f"_focus_tab failed: {e}")
 
     def get_groups(self) -> list[dict]:
         config = _load_config()

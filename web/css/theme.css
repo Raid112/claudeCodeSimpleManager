@@ -424,6 +424,14 @@ body {
     border-color: var(--status-ready);
     box-shadow: 0 0 6px var(--status-ready), 0 0 14px rgba(0, 255, 136, 0.3);
 }
+/* A ready session in a background tab pulses to grab attention; the pulse
+   stops once the tab is active (user has looked at it). */
+.tab:not(.active) .tab-dot.ready {
+    animation: tooluse-pulse 1.5s ease-in-out infinite;
+}
+.tab:not(.active).status-ready {
+    box-shadow: inset 0 -2px 0 var(--status-ready);
+}
 .tab .tab-dot.tooluse {
     background: var(--status-tooluse);
     border-color: var(--status-tooluse);

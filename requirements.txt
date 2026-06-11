@@ -1,3 +1,4 @@
 pywebview>=5.0
 pywinpty>=2.0.14
 websockets>=12.0
+windows-toasts>=1.1.1

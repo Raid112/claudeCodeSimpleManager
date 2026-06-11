@@ -291,7 +291,8 @@ class App {
                 }
                 // Authoritative hook state (claude only; null otherwise).
                 info.instance.backendState = serverData.state || null;
-                this._maybePlayStateSound(info.instance, serverData.state, serverData.state_ts);
+                info.instance.backendStateTs = serverData.state_ts ? serverData.state_ts * 1000 : null;
+                this._maybePlayStateSound(id, info.instance, serverData.state, serverData.state_ts);
             }
         }
 
@@ -310,7 +311,7 @@ class App {
      * transition, not once per 2s poll. First observation sets a baseline with
      * no sound, so restoring sessions with pre-existing state stays silent.
      */
-    _maybePlayStateSound(instance, state, stateTs) {
+    _maybePlayStateSound(id, instance, state, stateTs) {
         const ts = stateTs || 0;
         if (instance._lastStateTs === undefined) {
             instance._lastStateTs = ts;
@@ -322,6 +323,13 @@ class App {
                 TerminalInstance.playReadySound();
             } else if (state === 'tooluse' || state === 'waiting') {
                 TerminalInstance.playToolUseSound();
+            }
+            // Toast only when the window is in the background — sound covers the
+            // foreground case and the toast would be redundant noise.
+            if ((state === 'ready' || state === 'tooluse') && !document.hasFocus()) {
+                try {
+                    window.pywebview.api.notify_state(id, this.getDisplayName(id), state);
+                } catch (e) { /* notifications are best-effort */ }
             }
         }
     }

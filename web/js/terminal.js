@@ -97,6 +97,10 @@ class TerminalInstance {
         // the first hook event fires; while null we fall back to output heuristics.
         // Set by App.refreshStatus from get_terminals().state.
         this.backendState = null;
+        // Wall-clock ms of the hook event that set backendState (state_ts*1000).
+        // Used to detect that claude resumed streaming after a 'waiting' state
+        // without a new hook firing. null until the first hook event.
+        this.backendStateTs = null;
 
         // Explicit follow-mode state. true = output rolls to bottom; false = user is reading scrollback.
         // Transitions: user scrolls up → false. User clicks ↓ btn or buffer reaches genuine bottom → true.
@@ -277,9 +281,19 @@ class TerminalInstance {
      */
     get status() {
         if (!this.alive) return 'stopped';
-        if (this.backendState) return this.backendState;
 
         const idleMs = Date.now() - this.lastOutputTime;
+        if (this.backendState) {
+            // 'waiting' = claude idle waiting for input. If it resumed via an
+            // in-terminal reply (no UserPromptSubmit hook), it streams output
+            // before the next hook fires and would stay stuck purple. Fresh
+            // output after the hook ts means it's actually working again.
+            if (this.backendState === 'waiting' && this.backendStateTs &&
+                this.lastOutputTime > this.backendStateTs + 500 && idleMs < 3000) {
+                return 'running';
+            }
+            return this.backendState;
+        }
         if (idleMs < 3000) return 'running';
         return this._classifyIdleStatus();
     }
