@@ -19,14 +19,19 @@ python main.py
 pyinstaller ClaudeCodeLauncher.spec
 ```
 
+**Desktop shortcut:** `Claude Code Launcher.lnk` (área de trabalho) → `wscript.exe ClaudeCodeLauncher.vbs` → `python main.py` (workdir = repo root). O `.vbs` roda o código-fonte direto, **não** um `.exe` buildado — então mudanças em `web/` e `terminal/` aparecem só reiniciando o app pelo atalho (não precisa rebuild). Frontend (`web/`) é servido do disco: basta reabrir. Backend (`.py`): fechar e reabrir o app.
+
 There is a small test suite (no linter configured):
 
 ```bash
 # Run the unit tests (plain Node, no test framework)
 node tests/terminal-input.test.js
+node tests/teams-search.test.js
 ```
 
 `tests/terminal-input.test.js` covers `TerminalInput.prepareTerminalPaste()` and `prepareComposerMessage()` from `web/js/terminal-input.js`.
+
+`tests/teams-search.test.js` covers the message-picker helpers in `web/js/workitems.js` (search normalization, time labels, person aggregation, snippet) plus a stubbed-DOM smoke test of `_rows()` on the Mensagens segment.
 
 ## Architecture
 
@@ -40,7 +45,7 @@ node tests/terminal-input.test.js
 
 4. **terminal/ws_server.py** — Async WebSocket server (default port 8765). Each terminal tab connects via WebSocket. Handles bidirectional I/O: browser keystrokes → PTY stdin, PTY stdout → browser display. Also handles terminal resize messages (JSON with `type: "resize"`).
 
-5. **terminal/hook_state.py** — Authoritative per-session state store. Claude Code hooks call back into this app (`main.py --hook-notify`), which writes `{event, status, ts}` JSON to `%LOCALAPPDATA%\ClaudeManager\state\{claude_session_id}.json`. `_derive_status()` maps hook events to states: `running`, `ready`, `tooluse`, `waiting`. `get_terminals()` reads these files so the frontend poll can pick up state.
+5. **terminal/hook_state.py** — Authoritative per-session state store. Claude Code hooks call back into this app (`main.py --hook-notify`), which writes `{event, status, ts, session_id}` JSON to `%LOCALAPPDATA%\ClaudeManager\state\{tab_id}.json`. State is keyed by **tab_id** (the managed pty tab, passed to the hook via the `CLAUDEMANAGER_TAB` env var injected at spawn), NOT by session_id — because the user can swap the claude session_id under the same tab via `/clear` or `/resume`. The current session_id rides along as a field; `PtyManager.get_all_sessions()` follows the switch (reconciles `session.claude_session_id` + migrates the work-item link). `_derive_status()` maps hook events to states: `running`, `ready`, `tooluse`, `waiting`. `get_terminals()` reads these files so the frontend poll can pick up state.
 
 6. **terminal/hooks_settings.py** — Generates the per-session `--settings` file that wires Claude Code hooks (UserPromptSubmit/Stop/PreToolUse/PostToolUse/Notification) back to `main.py --hook-notify`.
 
