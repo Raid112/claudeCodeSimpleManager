@@ -67,6 +67,7 @@ from terminal.ws_server import WebSocketServer
 from terminal.agent_gateway import AgentGateway
 from terminal.hooks_settings import generate_hooks_settings
 from terminal.hook_state import gc_orphans
+from terminal.hermes_runtime import read_hermes_token
 from terminal import work_items, jira_client, teams_graph
 from api.bridge import Bridge, _load_config
 
@@ -156,7 +157,7 @@ def main():
             teams_graph,
             host="127.0.0.1",
             port=gateway_port,
-            hermes_token=os.environ.get("CLAUDEMANAGER_HERMES_TOKEN"),
+            hermes_token=read_hermes_token(),
             operator_token=os.environ.get("CLAUDEMANAGER_OPERATOR_CAPABILITY"),
             groups=_load_config().get("groups", []),
         )
