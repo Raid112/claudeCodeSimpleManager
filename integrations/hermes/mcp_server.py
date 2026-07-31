@@ -136,10 +136,21 @@ class McpServer:
         ]
 
     def handle(self, request: dict) -> dict:
-        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request:
+        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
             raise McpProtocolError("invalid JSON-RPC request")
         method = request.get("method")
         params = request.get("params") or {}
+        # MCP lifecycle notifications intentionally do not receive a JSON-RPC
+        # response. Returning an error response for them makes the stdio client
+        # treat the adapter as protocol-invalid and eventually park the server.
+        if method in {"notifications/initialized", "notifications/cancelled"}:
+            return None
+        if method == "ping":
+            if "id" not in request:
+                return None
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
+        if "id" not in request:
+            raise McpProtocolError("request id is required")
         if method == "initialize":
             return {"jsonrpc": "2.0", "id": request["id"], "result": {
                 "protocolVersion": "2024-11-05",
@@ -329,7 +340,8 @@ def main() -> int:
             response = server.handle(json.loads(line))
         except (json.JSONDecodeError, McpProtocolError) as exc:
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32602, "message": str(exc)}}
-        print(json.dumps(response, ensure_ascii=False), flush=True)
+        if response is not None:
+            print(json.dumps(response, ensure_ascii=False), flush=True)
     return 0
 
 

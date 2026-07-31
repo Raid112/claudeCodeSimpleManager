@@ -37,6 +37,15 @@ def test_tool_surface_is_narrow_and_protocol_errors_are_distinct():
         raise AssertionError("malformed MCP call must be a protocol error")
 
 
+def test_mcp_lifecycle_notifications_do_not_emit_responses_and_ping_is_supported():
+    server = McpServer("http://127.0.0.1:1", "token", attestation(), request_fn=lambda *args: (200, {}))
+    assert server.handle({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}) is None
+    assert server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}}) is None
+    assert server.handle({"jsonrpc": "2.0", "id": 7, "method": "ping", "params": {}}) == {
+        "jsonrpc": "2.0", "id": 7, "result": {}
+    }
+
+
 def test_business_rejection_is_mcp_is_error_and_second_cycle_can_submit():
     calls = []
 
