@@ -13,15 +13,17 @@ mcp_servers:
     command: python
     args:
       - C:/Users/you/ClaudeManager/integrations/hermes/mcp_server.py
+    connect_timeout: 10
+    timeout: 120
     env:
       CLAUDEMANAGER_AGENT_GATEWAY_URL: http://127.0.0.1:8787
-      CLAUDEMANAGER_HERMES_TOKEN: ${CLAUDEMANAGER_HERMES_TOKEN}
+      CLAUDEMANAGER_HERMES_TOKEN_FILE: C:/Users/you/AppData/Local/ClaudeManager/secrets/hermes_gateway_token
       HERMES_PROFILE: claudemanager
-      HERMES_VERSION: 0.19.0
+      HERMES_VERSION: 0.19.1
       HERMES_PROVIDER: openai-codex
       HERMES_MODEL: gpt-5.6-luna
       HERMES_CONFIG_HASH: ${HERMES_CONFIG_HASH}
       HERMES_SESSION_ID: ${HERMES_SESSION_ID}
 
-# The adapter also accepts CLAUDEMANAGER_HERMES_TOKEN_FILE when the Hermes
-# launcher does not interpolate environment values in mcp_servers.env.
+# The adapter also accepts CLAUDEMANAGER_HERMES_TOKEN for ephemeral/testing
+# launches, but prefer the protected token file above for a local install.
