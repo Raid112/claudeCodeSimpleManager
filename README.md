@@ -69,6 +69,25 @@ Project groups are saved in `config.json` (created automatically on first use). 
 }
 ```
 
+## Hermes Orchestrator (local MVP)
+
+ClaudeManager can host the native Hermes CLI/Desktop coordinator through the
+authenticated stdio MCP adapter in `integrations/hermes/mcp_server.py`. Hermes
+receives only redacted context and semantic tools: it must submit a proposal and
+wait for approval in the ClaudeManager UI before opening a session or sending the
+exact approved prompt.
+
+Setup and the shared CLI/Desktop configuration are documented in:
+
+- [`integrations/hermes/README.md`](integrations/hermes/README.md)
+- [`integrations/hermes/claudemanager-orchestrator.md`](integrations/hermes/claudemanager-orchestrator.md)
+- [`integrations/hermes/config.example.yaml`](integrations/hermes/config.example.yaml)
+
+The gateway stays on `127.0.0.1`; tokens are supplied through the environment or
+a protected token file. The adapter never exposes PTY IDs, paths, WebSocket
+access, PowerShell, or operator capabilities. WSL/VPS, public listeners, Docker
+as the main path, and external chat channels are outside this MVP.
+
 ## License
 
 MIT

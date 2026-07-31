@@ -1,0 +1,32 @@
+services:
+  hermes:
+    # Supply a pinned, operator-approved Hermes image; this file never builds or
+    # mounts ClaudeManager, Codex, project roots, or the Docker socket.
+    image: ${HERMES_IMAGE:?set HERMES_IMAGE to a pinned Hermes image}
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      HERMES_HOME: /opt/data
+      CLAUDEMANAGER_AGENT_GATEWAY_URL: ${CLAUDEMANAGER_AGENT_GATEWAY_URL:-http://host.docker.internal:8787}
+      CLAUDEMANAGER_HERMES_TOKEN_FILE: /run/secrets/claudemanager_gateway_token
+      HERMES_PROVIDER: openai-codex
+      HERMES_MODEL: gpt-5.6-luna
+      HERMES_PROFILE: ${HERMES_PROFILE:-claudemanager}
+      HERMES_VERSION: ${HERMES_VERSION:?set the pinned Hermes version}
+      HERMES_CONFIG_HASH: ${HERMES_CONFIG_HASH:?set the verified config hash}
+      HERMES_SESSION_ID: ${HERMES_SESSION_ID:?set the runtime session id}
+    secrets:
+      - claudemanager_gateway_token
+    volumes:
+      - hermes_data:/opt/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid
+
+secrets:
+  claudemanager_gateway_token:
+    file: ./secrets/gateway_token.txt
+
+volumes:
+  hermes_data:

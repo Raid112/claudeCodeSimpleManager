@@ -1,0 +1,27 @@
+# Example only. Copy the fragment into the shared HERMES_HOME configuration and
+# replace the adapter path with an absolute Windows path. Never put a real token
+# in this file.
+model:
+  provider: openai-codex
+  default: gpt-5.6-luna
+  fallback: []
+  auxiliary: null
+  delegated: null
+
+mcp_servers:
+  claudemanager:
+    command: python
+    args:
+      - C:/Users/you/ClaudeManager/integrations/hermes/mcp_server.py
+    env:
+      CLAUDEMANAGER_AGENT_GATEWAY_URL: http://127.0.0.1:8787
+      CLAUDEMANAGER_HERMES_TOKEN: ${CLAUDEMANAGER_HERMES_TOKEN}
+      HERMES_PROFILE: claudemanager
+      HERMES_VERSION: 0.19.0
+      HERMES_PROVIDER: openai-codex
+      HERMES_MODEL: gpt-5.6-luna
+      HERMES_CONFIG_HASH: ${HERMES_CONFIG_HASH}
+      HERMES_SESSION_ID: ${HERMES_SESSION_ID}
+
+# The adapter also accepts CLAUDEMANAGER_HERMES_TOKEN_FILE when the Hermes
+# launcher does not interpolate environment values in mcp_servers.env.
