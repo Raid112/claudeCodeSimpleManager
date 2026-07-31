@@ -68,19 +68,39 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def write_event(session_id: str, event_name: str, ts: float | None = None) -> None:
-    """Persist derived status for a hook event. Must never raise (callers are hooks)."""
+def _safe_log_event(session_id: str, event_name: str, tool_name: str | None, ts: float) -> None:
+    """Append the raw hook event to the work-items event log. Best-effort: a lazy
+    import + broad catch keep hook_state independent of work_items and unbreakable
+    (this runs inside a hook process; a failure here must never abort the hook)."""
+    try:
+        from terminal import work_items
+        work_items.log_event(session_id, event_name, tool_name=tool_name, ts=ts)
+    except Exception:
+        pass
+
+
+def write_event(session_id: str, event_name: str, ts: float | None = None,
+                tool_name: str | None = None, tab_id: str | None = None) -> None:
+    """Persist derived status for a hook event. Must never raise (callers are hooks).
+
+    State is keyed by `tab_id` (the managed tab, stable while the terminal lives)
+    when the hook knows it — NOT by session_id, which changes under the same tab on
+    /clear or /resume. The current claude session_id rides along as a field so the
+    backend can follow the switch (see PtyManager.get_all_sessions). Falls back to
+    session_id keying for unmanaged sessions (no CLAUDEMANAGER_TAB env)."""
     if not session_id or not event_name:
         return
     if ts is None:
         ts = time.time()
-    prev = read_state(session_id)
+    _safe_log_event(session_id, event_name, tool_name, ts)
+    key = tab_id or session_id
+    prev = read_state(key)
     prev_event = prev.get("event") if prev else None
     status = _derive_status(event_name, prev_event)
     if status is None:
         return
-    data = {"event": event_name, "status": status, "ts": ts}
-    _atomic_write(state_path(session_id), json.dumps(data))
+    data = {"event": event_name, "status": status, "ts": ts, "session_id": session_id}
+    _atomic_write(state_path(key), json.dumps(data))
 
 
 def read_state(session_id: str) -> dict | None:
