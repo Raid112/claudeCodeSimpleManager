@@ -232,6 +232,13 @@ class Bridge:
     def get_terminals(self) -> list[dict]:
         return self.pty_manager.get_all_sessions()
 
+    def issue_ws_capability(self, session_id: str) -> str | None:
+        """Issue one fresh WebSocket capability for a still-live managed tab."""
+        session = self.pty_manager.get_session(session_id)
+        if session is None or not session.is_alive:
+            return None
+        return self.ws_server.issue_capability(session_id)
+
     def get_ws_port(self) -> int:
         return self.ws_server.actual_port
 

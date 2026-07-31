@@ -1,0 +1,32 @@
+{
+  "tabs": [
+    {
+      "group_name": "clones",
+      "path": "C:/Users/caioc/clones",
+      "tab_order": 0,
+      "claude_session_id": "d6775ce5-c1b9-46d8-a633-68833897c52d",
+      "agent_session_id": "d6775ce5-c1b9-46d8-a633-68833897c52d",
+      "session_key": "b405e615-ec8b-4fc2-885f-004b229d1e70",
+      "terminal_type": "claude"
+    },
+    {
+      "group_name": "clones",
+      "path": "C:/Users/caioc/clones",
+      "tab_order": 1,
+      "claude_session_id": "aba0050f-8b46-4eb7-bc98-680f0fa4114a",
+      "agent_session_id": "aba0050f-8b46-4eb7-bc98-680f0fa4114a",
+      "session_key": "ec04a098-1e57-4e88-83c6-2e847640ee01",
+      "terminal_type": "claude"
+    },
+    {
+      "group_name": "clones",
+      "path": "C:/Users/caioc/clones",
+      "tab_order": 2,
+      "claude_session_id": "f577af9f-6a29-486b-a6c7-5cc2cdb88a60",
+      "agent_session_id": "f577af9f-6a29-486b-a6c7-5cc2cdb88a60",
+      "session_key": "5ff2d44a-62e8-4dfd-ac01-ac15cb4f989b",
+      "terminal_type": "claude"
+    }
+  ],
+  "active_tab_index": 0
+}

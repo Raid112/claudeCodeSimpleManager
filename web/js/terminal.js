@@ -78,11 +78,21 @@ class TerminalInstance {
 
     constructor(sessionId, wsPort, container, wsCapability) {
         this.sessionId = sessionId;
+        this.wsPort = wsPort;
         this.wsCapability = wsCapability;
         this.container = container;
         this.ws = null;
         this.alive = true;
+        this._disposed = false;
+        this._wsGeneration = 0;
+        this._wsConnected = false;
+        this._sawDisconnect = false;
         this.lastOutputTime = Date.now();
+
+        this._reconnectController = new ReconnectController(
+            () => this._requestReconnect(),
+            { delays: [500, 1000, 2000, 5000, 10000] },
+        );
 
         // Ring buffer of recent output chunks (cheap append, O(1) eviction).
         // Concatenated only when classification needs it.
@@ -255,20 +265,62 @@ class TerminalInstance {
         return true;
     }
 
-    _connectWs(wsPort) {
-        this.ws = new WebSocket(`ws://127.0.0.1:${wsPort}/${this.sessionId}`);
+    async _requestReconnect() {
+        if (this._disposed) return true;
 
-        this.ws.onopen = () => {
+        try {
+            const api = window.pywebview && window.pywebview.api;
+            if (!api || typeof api.issue_ws_capability !== 'function') return false;
+
+            const capability = await api.issue_ws_capability(this.sessionId);
+            if (!capability || this._disposed) return false;
+
+            this.wsCapability = capability;
+            this._connectWs(this.wsPort);
+            return true;
+        } catch (error) {
+            if (window.console && typeof window.console.warn === 'function') {
+                window.console.warn(`Failed to reconnect terminal ${this.sessionId}`, error);
+            }
+            return false;
+        }
+    }
+
+    _scheduleReconnect() {
+        if (!this._disposed) this._reconnectController.schedule();
+    }
+
+    _connectWs(wsPort) {
+        const generation = ++this._wsGeneration;
+        const socket = new WebSocket(`ws://127.0.0.1:${wsPort}/${this.sessionId}`);
+        this.ws = socket;
+
+        socket.onopen = () => {
+            if (generation !== this._wsGeneration || this._disposed) {
+                socket.close();
+                return;
+            }
+
+            this._wsConnected = true;
+            this.alive = true;
+            this._reconnectController.reset();
+            if (this._sawDisconnect) {
+                this.term.write('\r\n\x1b[92m--- Terminal reconectado ---\x1b[0m\r\n');
+                this._sawDisconnect = false;
+            }
+
             // The capability is sent only after the socket opens, never in the URL.
             // The server will not start PTY reader/writer tasks until this handshake passes.
-            this.ws.send(JSON.stringify({
+            socket.send(JSON.stringify({
                 type: 'handshake',
                 session_id: this.sessionId,
                 capability: this.wsCapability,
             }));
+            if (window.app) window.app.refreshStatus();
         };
 
-        this.ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+            if (generation !== this._wsGeneration || this._disposed) return;
             this.lastOutputTime = Date.now();
             this.term.write(event.data);
             this._appendRecent(event.data);
@@ -282,14 +334,35 @@ class TerminalInstance {
             }
         };
 
-        this.ws.onclose = () => {
+        socket.onclose = (event) => {
+            if (generation !== this._wsGeneration) return;
+            this._wsConnected = false;
             this.alive = false;
-            this.term.write('\r\n\x1b[90m--- Terminal desconectado ---\x1b[0m\r\n');
+            if (window.console && typeof window.console.warn === 'function') {
+                window.console.warn('Terminal WebSocket closed', {
+                    sessionId: this.sessionId,
+                    code: event.code,
+                    reason: event.reason,
+                    wasClean: event.wasClean,
+                });
+            }
+            if (!this._disposed) {
+                this._sawDisconnect = true;
+                this.term.write('\r\n\x1b[90m--- Terminal desconectado; reconectando... ---\x1b[0m\r\n');
+                this._scheduleReconnect();
+            }
             if (window.app) window.app.refreshStatus();
         };
 
-        this.ws.onerror = () => {
+        socket.onerror = () => {
+            if (generation !== this._wsGeneration || this._disposed) return;
+            this._wsConnected = false;
             this.alive = false;
+            this._sawDisconnect = true;
+            if (window.console && typeof window.console.warn === 'function') {
+                window.console.warn(`Terminal WebSocket error for ${this.sessionId}`);
+            }
+            this._scheduleReconnect();
         };
     }
 
@@ -306,7 +379,7 @@ class TerminalInstance {
      * is read multiple times per poll and must stay side-effect free.
      */
     get status() {
-        if (!this.alive) return 'stopped';
+        if (!this.alive || (this._sawDisconnect && !this._wsConnected)) return 'stopped';
 
         const idleMs = Date.now() - this.lastOutputTime;
         if (this.backendState) {
@@ -436,6 +509,9 @@ class TerminalInstance {
     }
 
     dispose() {
+        this._disposed = true;
+        this._reconnectController.cancel();
+        this._wsGeneration += 1;
         clearTimeout(this._userScrollTimer);
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();

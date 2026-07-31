@@ -23,6 +23,15 @@ def test_capabilities_bind_tab_expire_and_replay():
     assert not store.consume(wrong_origin, "private-tab-1", "https://evil.invalid", now=101.0)
 
 
+def test_pywebview_loopback_origin_is_allowed_but_remote_origin_is_not():
+    store = WsCapabilityStore(ttl_seconds=30)
+    local = store.issue("tab-1", now=100.0)
+    assert store.consume(local, "tab-1", "http://127.0.0.1:50382", now=101.0)
+
+    remote = store.issue("tab-1", now=100.0)
+    assert not store.consume(remote, "tab-1", "http://127.0.0.2:50382", now=101.0)
+
+
 def test_revoke_and_active_capability_cleanup():
     store = WsCapabilityStore(ttl_seconds=30)
     token = store.issue("tab-1")

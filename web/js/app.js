@@ -97,9 +97,10 @@ class App {
         this.wsPort = null;
         this._isRenaming = false;
 
-        // Work-items snapshot ({version, items, session_links}), cached and refreshed only on
-        // mutation (create/link/complete/archive/reorder/jira-refresh) — NOT on the 2s status
-        // poll. Live state (running/ready) is joined in from get_terminals at render time.
+        // Work-items snapshot ({version, items, session_links}), refreshed after local
+        // mutations and periodically so external actors (Hermes/gateway) appear without
+        // requiring an app restart. Live state (running/ready) is joined in from get_terminals
+        // at render time.
         this.workItems = { items: [], session_links: {} };
 
         // Gaveta: id do work item travado (só as abas dele ficam expandidas). null = nada travado.
@@ -235,6 +236,10 @@ class App {
 
         // Periodic session save (every 10s) to survive crashes
         setInterval(() => this._saveSessions(), 10000);
+
+        // Work Items can also be created/changed through the Hermes gateway, outside this
+        // webview. Keep the sidebar/tab projection fresh without requiring a restart.
+        setInterval(() => this.refreshWorkItems(), 5000);
     }
 
     async openTerminal(groupName, path, continueSession = false, claudeSessionId = null, terminalType = null, agentSessionId = null, sessionKey = null) {
@@ -575,12 +580,18 @@ class App {
     /** Refetch the work-items snapshot and re-render the sidebar/tabs. Call after mutations. */
     async refreshWorkItems() {
         try {
-            this.workItems = await window.pywebview.api.list_work_items();
+            const next = await window.pywebview.api.list_work_items();
+            // Avoid rebuilding the sidebar/tab DOM on every polling tick when the snapshot
+            // did not change. This keeps drag state and active UI interactions stable.
+            if (JSON.stringify(next) === JSON.stringify(this.workItems)) return false;
+            this.workItems = next;
         } catch (e) {
             console.warn('list_work_items failed', e);
+            return false;
         }
         await this.sidebar.render();
         this.tabBar.render();
+        return true;
     }
 
     async linkSessionToItem(sessionId, wiId) {

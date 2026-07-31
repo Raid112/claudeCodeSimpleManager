@@ -19,7 +19,11 @@ class WsCapabilityStore:
 
     def __init__(self, ttl_seconds: float = 60.0, allowed_origins: set[str] | None = None):
         self.ttl_seconds = float(ttl_seconds)
-        self.allowed_origins = set(allowed_origins or {"", "null", "file://", "file:///"})
+        self._allow_loopback_http = allowed_origins is None
+        self.allowed_origins = set(
+            {"", "null", "file://", "file:///"}
+            if allowed_origins is None else allowed_origins
+        )
         self._records: dict[str, dict] = {}
         self._lock = threading.RLock()
 
@@ -48,10 +52,29 @@ class WsCapabilityStore:
                 return False
             if record["session_id"] != session_id or record["expires_at"] <= current:
                 return False
-            if (origin or "") not in self.allowed_origins:
+            if not self._origin_allowed(origin):
                 return False
             record["used"] = True
             return True
+
+    def _origin_allowed(self, origin: str | None) -> bool:
+        value = origin or ""
+        if value in self.allowed_origins:
+            return True
+        if not self._allow_loopback_http:
+            return False
+
+        # With JS API enabled, pywebview serves local files from a random
+        # http://127.0.0.1:<port> origin. The WebSocket server is also loopback-only,
+        # so accept that local origin without allowing arbitrary web pages.
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+        )
 
     def revoke(self, token: str) -> None:
         with self._lock:
@@ -196,8 +219,14 @@ class WebSocketServer:
 
         try:
             await asyncio.gather(read_task, write_task)
-        except (websockets.exceptions.ConnectionClosed, Exception):
-            pass
+        except Exception as exc:
+            if isinstance(exc, websockets.exceptions.ConnectionClosed):
+                print(
+                    f"[ws] session={session_id} closed "
+                    f"code={exc.code} reason={exc.reason!r}"
+                )
+            else:
+                print(f"[ws] session={session_id} handler stopped ({type(exc).__name__})")
         finally:
             read_task.cancel()
             write_task.cancel()
@@ -210,9 +239,14 @@ class WebSocketServer:
                 if data:
                     log_input_boundary("pty->ws", data, session_id=session.id)
                     await websocket.send(data)
+                elif hasattr(session, "is_alive") and not session.is_alive:
+                    print(f"[ws] session={session.id} PTY exited")
+                    await websocket.close(1011, "PTY exited")
+                    break
                 else:
                     await asyncio.sleep(0.01)
-            except Exception:
+            except Exception as exc:
+                print(f"[ws] session={session.id} PTY->WS stopped ({type(exc).__name__})")
                 break
 
     async def _ws_to_pty(self, session, websocket):
@@ -228,5 +262,6 @@ class WebSocketServer:
                 text = message if isinstance(message, str) else message.decode()
                 log_input_boundary("ws->pty", text, session_id=session.id)
                 session.write(text)
-            except Exception:
+            except Exception as exc:
+                print(f"[ws] session={session.id} WS->PTY stopped ({type(exc).__name__})")
                 break

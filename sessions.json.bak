@@ -1,0 +1,32 @@
+{
+  "tabs": [
+    {
+      "group_name": "clones",
+      "path": "C:/Users/caioc/clones",
+      "tab_order": 0,
+      "claude_session_id": "084577a1-f4b4-47c6-8567-900390f31560",
+      "terminal_type": "claude",
+      "custom_name": null,
+      "last_message_time": 1784738349365
+    },
+    {
+      "group_name": "clones",
+      "path": "C:/Users/caioc/clones",
+      "tab_order": 1,
+      "claude_session_id": "c186f07e-0338-407a-a708-58d86ba631a2",
+      "terminal_type": "claude",
+      "custom_name": null,
+      "last_message_time": 1784739162240
+    },
+    {
+      "group_name": "ClaudeManager",
+      "path": "C:/Users/caioc/ClaudeManager",
+      "tab_order": 2,
+      "claude_session_id": "1993eb21-83e7-46a7-bd14-1c88924c7bb5",
+      "terminal_type": "claude",
+      "custom_name": null,
+      "last_message_time": 1784739142263
+    }
+  ],
+  "active_tab_index": 0
+}
