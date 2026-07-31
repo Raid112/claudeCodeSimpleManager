@@ -24,3 +24,6 @@ config.json
 
 # Runtime session state
 sessions.json
+
+# Secrets (Jira token, Graph ids). Lives in %LOCALAPPDATA%; ignored here as belt-and-suspenders.
+secrets.json
