@@ -3,11 +3,11 @@
  */
 
 const TERMINAL_THEME = {
-    background: '#0a0a0a',
-    foreground: '#e2e8f0',
-    cursor: '#a855f7',
-    cursorAccent: '#0a0a0a',
-    selectionBackground: 'rgba(168, 85, 247, 0.3)',
+    background: '#000000',
+    foreground: '#e8e8ef',
+    cursor: '#ffffff',
+    cursorAccent: '#000000',
+    selectionBackground: 'rgba(255, 255, 255, 0.22)',
     selectionForeground: '#e2e8f0',
     black: '#1e1e2e',
     red: '#f38ba8',
@@ -76,8 +76,9 @@ class TerminalInstance {
         } catch (e) { /* ignore audio errors */ }
     }
 
-    constructor(sessionId, wsPort, container) {
+    constructor(sessionId, wsPort, container, wsCapability) {
         this.sessionId = sessionId;
+        this.wsCapability = wsCapability;
         this.container = container;
         this.ws = null;
         this.alive = true;
@@ -103,10 +104,11 @@ class TerminalInstance {
         this.backendStateTs = null;
 
         // Explicit follow-mode state. true = output rolls to bottom; false = user is reading scrollback.
-        // Transitions: user scrolls up → false. User clicks ↓ btn or buffer reaches genuine bottom → true.
+        // autoFollow ONLY changes on a real user scroll (wheel). write/resize/scrollback-trim all
+        // emit onScroll too, but must NOT flip follow — that was the old "jumps while reading" bug.
         this.autoFollow = true;
-        this._suppressScrollEvent = false; // ignore programmatic scrollToBottom in onScroll handler
-        this._lastBaseY = 0;
+        this._userScrolling = false;   // true briefly after a real wheel event; gates follow changes
+        this._userScrollTimer = null;
 
         // Time of last user-originated message — drives the 1h cache countdown shown on the tab.
         // Set by Composer._send and by direct \r input here (filtered by status).
@@ -163,14 +165,20 @@ class TerminalInstance {
         });
         container.appendChild(this._scrollBtn);
 
-        // Detect manual scroll to toggle autoFollow off; re-enable only when user reaches genuine bottom.
+        // Mark a short window after a real wheel gesture. Only during this window may
+        // onScroll change autoFollow — so output/resize/trim-driven onScroll events
+        // (which also fire) can never flip follow on their own.
+        container.addEventListener('wheel', () => {
+            this._userScrolling = true;
+            clearTimeout(this._userScrollTimer);
+            this._userScrollTimer = setTimeout(() => { this._userScrolling = false; }, 200);
+        }, { passive: true });
+
+        // Follow toggles only on user-driven scroll: up → stop following, back to bottom → resume.
         this.term.onScroll(() => {
-            if (this._suppressScrollEvent) return;
-            const buf = this.term.buffer.active;
-            if (buf.viewportY < buf.baseY) {
-                this.autoFollow = false;
-            } else if (buf.viewportY === buf.baseY) {
-                this.autoFollow = true;
+            if (this._userScrolling) {
+                const buf = this.term.buffer.active;
+                this.autoFollow = buf.viewportY >= buf.baseY;
             }
             this._updateScrollBtn();
         });
@@ -189,11 +197,19 @@ class TerminalInstance {
                 });
                 return false; // prevent xterm from sending \x16
             }
-            if (ev.ctrlKey && ev.key === 'c' && this.term.hasSelection()) {
-                navigator.clipboard.writeText(this.term.getSelection());
+            if (ev.ctrlKey && ev.key.toLowerCase() === 'c' && this.term.hasSelection()) {
+                this._copySelection();
                 return false; // prevent sending SIGINT when copying
             }
             return true;
+        });
+
+        // copyOnSelect: copy as soon as the mouse selection is released. The new
+        // Claude CLI re-renders constantly (spinner/status line), and each incoming
+        // write can clear the selection before Ctrl+C fires — so Ctrl+C would miss
+        // the selection and send SIGINT instead. Copying on mouseup sidesteps that.
+        container.addEventListener('mouseup', () => {
+            if (this.term.hasSelection()) this._copySelection();
         });
 
         // Handle input -> send to PTY. Do NOT force scroll here; autoFollow controls following.
@@ -241,6 +257,16 @@ class TerminalInstance {
 
     _connectWs(wsPort) {
         this.ws = new WebSocket(`ws://127.0.0.1:${wsPort}/${this.sessionId}`);
+
+        this.ws.onopen = () => {
+            // The capability is sent only after the socket opens, never in the URL.
+            // The server will not start PTY reader/writer tasks until this handshake passes.
+            this.ws.send(JSON.stringify({
+                type: 'handshake',
+                session_id: this.sessionId,
+                capability: this.wsCapability,
+            }));
+        };
 
         this.ws.onmessage = (event) => {
             this.lastOutputTime = Date.now();
@@ -307,15 +333,10 @@ class TerminalInstance {
         }
     }
 
-    /** Programmatic scroll to bottom that does not flip autoFollow back on via onScroll. */
+    /** Programmatic scroll to bottom. Safe to call freely: onScroll only flips follow
+     *  during a user wheel window, so this never accidentally re-enables autoFollow. */
     _scrollToBottomProgrammatic() {
-        this._suppressScrollEvent = true;
-        try {
-            this.term.scrollToBottom();
-        } finally {
-            // Restore on next tick — onScroll fires sync inside scrollToBottom in current xterm versions
-            setTimeout(() => { this._suppressScrollEvent = false; }, 0);
-        }
+        this.term.scrollToBottom();
     }
 
     /** Analyze recent terminal output to distinguish tool-use request from chat completion. */
@@ -389,7 +410,33 @@ class TerminalInstance {
         this.term.focus();
     }
 
+    /** Copy current xterm selection to the OS clipboard, with a WebView2 fallback. */
+    _copySelection() {
+        const text = this.term.getSelection();
+        if (!text) return;
+        try {
+            navigator.clipboard.writeText(text).catch(() => this._copyFallback(text));
+        } catch (e) {
+            this._copyFallback(text);
+        }
+    }
+
+    /** Legacy clipboard path for contexts where navigator.clipboard is blocked. */
+    _copyFallback(text) {
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+        } catch (e) { /* clipboard unavailable */ }
+    }
+
     dispose() {
+        clearTimeout(this._userScrollTimer);
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
         }

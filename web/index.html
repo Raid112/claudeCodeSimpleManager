@@ -8,23 +8,39 @@
     <link rel="stylesheet" href="css/theme.css">
 </head>
 <body>
+    <!-- SVG icon defs (referenced by <use href="#..."> across the UI) -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <defs>
+        <g id="i-link"><path d="M9 12h6M10.5 8.5H8a3.5 3.5 0 0 0 0 7h2.5M13.5 8.5H16a3.5 3.5 0 0 1 0 7h-2.5"/></g>
+        <g id="i-x"><path d="M5 5l10 10M15 5L5 15"/></g>
+        <g id="i-arch"><rect x="3.5" y="5.5" width="13" height="11" rx="1.2"/><path d="M2.5 5.5h15V3.5h-15zM8 9h4"/></g>
+        <g id="i-issue"><rect x="3.5" y="3.5" width="13" height="13" rx="2.5"/><path d="M7 10l2 2 4-4"/></g>
+        <g id="i-msg"><path d="M4 5.5h12v8H9l-3 2.5V13.5H4z"/></g>
+        <g id="i-todo"><path d="M4 6h9M4 10h9M4 14h6M15.5 12.5l1.3 1.3 2.2-2.6"/></g>
+        <g id="i-add"><path d="M10 4v12M4 10h12"/></g>
+        <g id="i-bolt"><path d="M11 2 4 11h5l-1 7 7-9h-5z"/></g>
+        <g id="i-check"><path d="M4 10l4 4 8-9"/></g>
+        <g id="i-wait"><path d="M7 5v10M13 5v10"/></g>
+        <g id="i-play"><path d="M7 5l8 5-8 5z"/></g>
+      </defs>
+    </svg>
+
     <!-- Title Bar -->
     <div class="title-bar">
         <h1>⚡ Claude Code Launcher</h1>
+        <span class="titlebar-daily" id="daily-btn" title="Resumo do que fiz hoje/ontem (daily)">📋 daily</span>
     </div>
 
     <!-- Main Layout -->
     <div class="main-container">
         <!-- Sidebar -->
-        <div class="sidebar">
-            <div class="sidebar-header">Grupos</div>
+        <div class="sidebar" id="sidebar">
             <div class="sidebar-groups" id="sidebar-groups"></div>
-            <div class="sidebar-footer">
-                <div class="add-group-btn" id="add-group-btn">
-                    <span>＋</span>
-                    <span>Adicionar grupo</span>
-                </div>
-            </div>
+            <section class="agent-approvals" id="agent-approvals"></section>
+            <div class="sidebar-footer"></div>
+            <!-- Fora de #sidebar-groups de propósito: aquele nó é reescrito inteiro a cada 2s
+                 (Sidebar.render), o que destruiria o handle no meio do arrasto. -->
+            <div class="sidebar-resizer" id="sidebar-resizer" title="arraste para redimensionar"></div>
         </div>
 
         <!-- Terminal Area -->
@@ -40,8 +56,8 @@
                         <!-- Welcome Screen -->
                         <div class="welcome" id="welcome">
                             <div class="welcome-icon">⚡</div>
-                            <div class="welcome-text">Clique <b>+</b> em um grupo para abrir um terminal</div>
-                            <div class="welcome-hint">Cada terminal roda no diretório do projeto (tipo configurado na sidebar)</div>
+                            <div class="welcome-text">Clique um chip em <b>Nova aba</b> para abrir um terminal</div>
+                            <div class="welcome-hint">Vincule a aba a uma issue, mensagem ou TODO pelo ícone de elo — vira seu work item</div>
                         </div>
                     </div>
                 </div>
@@ -83,6 +99,8 @@
     <script src="js/sidebar.js"></script>
     <script src="js/tabs.js"></script>
     <script src="js/composer.js"></script>
+    <script src="js/workitems.js"></script>
+    <script src="js/agent-approvals.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>
