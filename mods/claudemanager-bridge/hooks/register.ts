@@ -9,9 +9,21 @@ import { connect, isConnected, send } from './client'
 
 const PLUGIN_VERSION = '0.1.0'
 const USAGE_EVERY_MS = 5000
+// tool.check runs before the mode settles an ask: under auto / acceptEdits the
+// classifier or the mode often lets the call run with no dialog. So an `ask` is
+// reported only if the call is still held this long after it; one the mode settles
+// sooner never flashes `tooluse` (no composer block, no chime, no Hermes wake-up).
+const ASK_GRACE_MS = 3000
 
 let sessionId = ''
 let lastUsageAt = 0
+const pendingAsks = new Map<string, { cancel: () => void }>()
+
+function settleAsk(toolUseId: string | undefined): void {
+  if (!toolUseId) return
+  pendingAsks.get(toolUseId)?.cancel()
+  pendingAsks.delete(toolUseId)
+}
 
 async function refreshSessionId($: EngineInterface): Promise<void> {
   try {
@@ -79,6 +91,7 @@ export const register: Register = on => {
     try {
       return await next(e)
     } finally {
+      settleAsk(e.tool_use_id)
       event($, 'PostToolUse', fields)
     }
   }).catch(($, e, next) => next(e)) // fail open: a broken report never blocks a tool
@@ -86,8 +99,13 @@ export const register: Register = on => {
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
     // A query ($.tool.check) has no tool_use_id and opens no dialog.
-    if (isConnected() && verdict.decision === 'ask' && e.tool_use_id) {
-      event($, 'PermissionAsk', { tool_name: e.tool, tool_use_id: e.tool_use_id, agent_id: e.agentId })
+    const id = e.tool_use_id
+    if (isConnected() && verdict.decision === 'ask' && id && !pendingAsks.has(id)) {
+      const fields = { tool_name: e.tool, tool_use_id: id, agent_id: e.agentId }
+      pendingAsks.set(id, $.clock.after(ASK_GRACE_MS, () => {
+        pendingAsks.delete(id)
+        event($, 'PermissionAsk', fields)
+      }))
     }
     return verdict
   }).catch(($, e, next) => next(e)) // fail open: the engine's own verdict stands
@@ -95,6 +113,7 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (isConnected() && e.agentId === undefined) {
+      for (const id of [...pendingAsks.keys()]) settleAsk(id)
       if (e.reason === 'error' || e.reason === 'refusal') {
         event($, 'StopFailure', { error: true })
       } else {

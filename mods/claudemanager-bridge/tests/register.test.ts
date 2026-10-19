@@ -8,7 +8,7 @@ type Post = { path: string; token: string | undefined; body: any }
 
 // The engine beneath the plugin: the session's nouns answered from memory and
 // every $.http.fetch recorded instead of sent.
-function world(on: On, env: Record<string, string>) {
+function world(on: On, env: Record<string, string>, opts: { askHoldMs?: number; engine?: any } = {}) {
   const posts: Post[] = []
   const clock = mock.clock(on)
   mock.env(on, env)
@@ -25,7 +25,16 @@ function world(on: On, env: Record<string, string>) {
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('tool.check', ($, e) => ({ decision: ((e.input as any)?.verdict ?? 'allow') as any }))
-  on('tool.call', () => ({ result: { text: 'done' } }) as any)
+  // With askHoldMs, a tool call behaves as in a session: the permission check runs
+  // inside tool.call's core and answers `ask`, then the call is held (a dialog
+  // open) for askHoldMs before it resolves.
+  on('tool.call', async (_$, e) => {
+    if (opts.askHoldMs !== undefined && opts.engine) {
+      await opts.engine.tool.check({ tool: e.tool, input: { verdict: 'ask' }, tool_use_id: (e as any).tool_use_id } as any)
+      if (opts.askHoldMs) await clock.advance(opts.askHoldMs)
+    }
+    return { result: { text: 'done' } } as any
+  })
   on('session.end', () => ({ sessionId: sid }) as any)
   return { posts, clock, swapSession: (next: string) => { sid = next } }
 }
@@ -54,18 +63,26 @@ test('hello carries the session id, the engine build and the tab token', async (
   expect(posts[0]?.body).toEqual(expect.objectContaining({ session_id: 'sid-1', engine_version: '2.1.303', cwd: 'C:/work' }))
 })
 
-test('a turn with a tool and a permission ask maps to the hook vocabulary, in order', async ($, on) => {
-  const { posts, clock } = world(on, ENV)
+test('an ask still held after the grace (a real dialog) is a PermissionAsk inside the tool call', async ($, on) => {
+  const w = world(on, ENV, { askHoldMs: 4000, engine: $ })
   await $.session.start(START)
   await $.turn.start({ text: 'hi', turnId: 't1' })
-  await $.tool.check({ tool: 'Bash', input: { verdict: 'ask' }, tool_use_id: 'tu-1' } as any)
   await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: 'tu-1' } as any)
   await $.turn.complete(turnEnd('answer'))
-  await clock.settle()
-  expect(events(posts)).toEqual(['UserPromptSubmit', 'PermissionAsk', 'PreToolUse', 'PostToolUse', 'Stop'])
-  const seqs = posts.map(p => p.body.seq)
+  await w.clock.settle()
+  expect(events(w.posts)).toEqual(['UserPromptSubmit', 'PreToolUse', 'PermissionAsk', 'PostToolUse', 'Stop'])
+  const seqs = w.posts.map(p => p.body.seq)
   expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
-  expect(posts.some(p => p.path === '/v1/usage')).toBe(true)
+  expect(w.posts.some(p => p.path === '/v1/usage')).toBe(true)
+})
+
+test('an ask the mode settles within the grace (auto classifier) is never reported', async ($, on) => {
+  const w = world(on, ENV, { askHoldMs: 0, engine: $ })
+  await $.session.start(START)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: 'tu-1' } as any)
+  await w.clock.advance(10000)
+  expect(events(w.posts)).toEqual(['UserPromptSubmit', 'PreToolUse', 'PostToolUse'])
 })
 
 test('a query check and an allow verdict report no permission ask', async ($, on) => {
@@ -74,7 +91,7 @@ test('a query check and an allow verdict report no permission ask', async ($, on
   await $.turn.start({ text: 'hi', turnId: 't1' })
   await $.tool.check({ tool: 'Bash', input: { verdict: 'ask' } } as any)
   await $.tool.check({ tool: 'Bash', input: { verdict: 'allow' }, tool_use_id: 'tu-2' } as any)
-  await clock.settle()
+  await clock.advance(10000)
   expect(events(posts)).toEqual(['UserPromptSubmit'])
 })
 
