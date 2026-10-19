@@ -20,7 +20,7 @@ from terminal.hook_state import delete_state, read_state
 from terminal.agent_contracts import (
     ACTION_SEND_PROMPT, EXECUTION_SENT, EXECUTION_UNKNOWN, STATUS_APPROVED, STATUS_EXPIRED,
 )
-from terminal import agent_decisions
+from terminal import agent_decisions, ui_log
 from terminal.input_protocol import prepare_composer_message, InputProtocolError
 from terminal.session_registry import SessionRegistry
 from terminal.session_support import (
@@ -111,10 +111,17 @@ class PtySession:
             return False
 
     def resize(self, cols: int, rows: int):
+        """Tell the PTY its new size. A FAILURE HERE IS INVISIBLE to the user: xterm already
+        reflowed to `cols`x`rows`, the child process keeps the old size, and the screen stays
+        broken until some later resize happens to succeed (switching tabs, minimizing) --
+        the exact symptom being chased. Still best-effort, but no longer silent: both
+        outcomes land in the UI log next to the frontend's own resize records."""
         try:
             self.pty.set_size(cols, rows)
-        except Exception:
-            pass
+            ui_log.log("pty.resize", src="py", session=self.id, cols=cols, rows=rows)
+        except Exception as exc:
+            ui_log.log("pty.resize.failed", src="py", session=self.id, cols=cols, rows=rows,
+                       error=f"{type(exc).__name__}: {exc}")
 
     def kill(self):
         try:

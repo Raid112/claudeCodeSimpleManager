@@ -108,3 +108,12 @@ def log_input_boundary(boundary: str, data: str, **extra):
     )
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     _write_line(f"{ts} [{boundary}] {details}")
+
+
+def log_output_summary(session_id, chunks: int, chars: int, window_s: float):
+    """Cheap always-on trail of PTY output: one line per window with traffic. Enough to
+    tell "Claude stopped emitting" from "output flows but the screen doesn't move"."""
+    if not LOG_INPUT:
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_line(f"{ts} [pty->ws.sum] chunks={chunks}, chars={chars}, window={window_s:.1f}s, session_id={session_id!r}")

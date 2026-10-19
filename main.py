@@ -68,7 +68,7 @@ from terminal.agent_gateway import AgentGateway
 from terminal.hooks_settings import generate_hooks_settings
 from terminal.hook_state import gc_orphans
 from terminal.hermes_runtime import read_hermes_token
-from terminal import work_items, jira_client, teams_graph
+from terminal import work_items, jira_client, teams_graph, ui_log
 from api.bridge import Bridge, _load_config
 
 
@@ -116,6 +116,8 @@ def main():
         work_items.gc_events()  # drop event partitions older than 60 days
     except Exception:
         pass
+    ui_log.gc()  # UI diagnostics: keep a week (see terminal/ui_log.py)
+    ui_log.log("app.start", src="py")
 
     # Warm up the Teams Graph token off the main thread so a fresh machine (no MSAL cache)
     # gets its one-time device-code login without blocking app boot. With a valid cache this
@@ -205,8 +207,10 @@ def main():
 
     window.events.closing += on_closing
 
-    # Start pywebview (blocks until window is closed)
-    webview.start(debug=True)
+    # DevTools only when asked for (CLAUDEMANAGER_DEBUG=1). It used to open with every
+    # window, which is a request inspector nobody asked for on every launch; the UI log
+    # in %LOCALAPPDATA%\ClaudeManager\logs covers the diagnostics it was there for.
+    webview.start(debug=os.environ.get("CLAUDEMANAGER_DEBUG") == "1")
 
 
 if __name__ == "__main__":

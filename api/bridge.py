@@ -3,6 +3,7 @@ pywebview JS API bridge — exposes Python functions to JavaScript.
 """
 
 import json
+import os
 import secrets
 import time
 import uuid
@@ -14,6 +15,7 @@ from terminal.pty_manager import PtyManager
 from terminal.ws_server import WebSocketServer
 from terminal import work_items, jira_client, teams_graph
 from terminal import agent_decisions
+from terminal import ui_log
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 SESSIONS_PATH = Path(__file__).parent.parent / "sessions.json"
@@ -93,6 +95,24 @@ class Bridge:
             self._toaster.show_toast(toast)
         except Exception as e:
             print(f"notify_state failed (toast skipped): {e}")
+
+    def ui_log(self, records: list) -> int:
+        """Append a batch of frontend diagnostics (see web/js/uilog.js). Returns how many
+        lines were written. Never raises: the log must never be why the UI breaks."""
+        try:
+            return ui_log.append(records or [], src="ui")
+        except Exception:
+            return 0
+
+    def open_logs_dir(self) -> str:
+        r"""Open %LOCALAPPDATA%\ClaudeManager\logs in the Explorer and return its path."""
+        try:
+            path = ui_log.log_dir()
+            os.startfile(str(path))
+            return str(path)
+        except Exception as exc:
+            print(f"open_logs_dir failed: {exc}")
+            return ""
 
     def _focus_tab(self, session_id: str):
         """Bring the window to the foreground and select the given tab.

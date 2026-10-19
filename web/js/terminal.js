@@ -89,6 +89,19 @@ class TerminalInstance {
         this._sawDisconnect = false;
         this.lastOutputTime = Date.now();
 
+        // Output trail for the "screen freezes, input reaches claude" bug: chunks received vs
+        // chunks xterm finished parsing. `pending` stuck > 0 means xterm stalled; no chunks
+        // while backend [pty->ws.sum] keeps counting means the socket path stalled.
+        this._rxStats = { chunks: 0, chars: 0, parsed: 0, pending: 0 };
+        this._rxTimer = setInterval(() => {
+            const rx = this._rxStats;
+            if (!rx.chunks && !rx.pending) return;
+            if (typeof UiLog !== 'undefined') {
+                UiLog.push('ws.rx', { session: this.sessionId, chunks: rx.chunks, chars: rx.chars, parsed: rx.parsed, pending: rx.pending });
+            }
+            rx.chunks = 0; rx.chars = 0; rx.parsed = 0;
+        }, 5000);
+
         this._reconnectController = new ReconnectController(
             () => this._requestReconnect(),
             { delays: [500, 1000, 2000, 5000, 10000] },
@@ -234,10 +247,17 @@ class TerminalInstance {
             }
         });
 
-        // Handle resize
+        // Handle resize. The PTY only learns about a new size here — if the socket is not
+        // open the resize is SILENTLY LOST and xterm and the PTY disagree until the next
+        // one, which is exactly the "broken columns" shape. Log both outcomes.
         this.term.onResize(({ cols, rows }) => {
-            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                this.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+            const open = !!(this.ws && this.ws.readyState === WebSocket.OPEN);
+            if (open) this.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+            if (typeof UiLog !== 'undefined') {
+                UiLog.push(open ? 'resize.sent' : 'resize.dropped', {
+                    session: this.sessionId, cols, rows,
+                    ws: this.ws ? this.ws.readyState : -1,
+                });
             }
         });
     }
@@ -279,8 +299,11 @@ class TerminalInstance {
             this._connectWs(this.wsPort);
             return true;
         } catch (error) {
-            if (window.console && typeof window.console.warn === 'function') {
-                window.console.warn(`Failed to reconnect terminal ${this.sessionId}`, error);
+            if (typeof UiLog !== 'undefined') {
+                UiLog.push('ws.reconnect.failed', {
+                    session: this.sessionId,
+                    message: String((error && error.message) || error),
+                });
             }
             return false;
         }
@@ -303,6 +326,13 @@ class TerminalInstance {
 
             this._wsConnected = true;
             this.alive = true;
+            if (typeof UiLog !== 'undefined') {
+                UiLog.push('ws.open', {
+                    session: this.sessionId,
+                    attempt: this._reconnectController.attempt,
+                    cols: this.term.cols, rows: this.term.rows,
+                });
+            }
             this._reconnectController.reset();
             if (this._sawDisconnect) {
                 this.term.write('\r\n\x1b[92m--- Terminal reconectado ---\x1b[0m\r\n');
@@ -322,7 +352,11 @@ class TerminalInstance {
         socket.onmessage = (event) => {
             if (generation !== this._wsGeneration || this._disposed) return;
             this.lastOutputTime = Date.now();
-            this.term.write(event.data);
+            const rx = this._rxStats;
+            rx.chunks += 1;
+            rx.chars += event.data.length || 0;
+            rx.pending += 1;
+            this.term.write(event.data, () => { rx.pending -= 1; rx.parsed += 1; });
             this._appendRecent(event.data);
             this._cachedIdleStale = true;
 
@@ -338,12 +372,13 @@ class TerminalInstance {
             if (generation !== this._wsGeneration) return;
             this._wsConnected = false;
             this.alive = false;
-            if (window.console && typeof window.console.warn === 'function') {
-                window.console.warn('Terminal WebSocket closed', {
-                    sessionId: this.sessionId,
+            if (typeof UiLog !== 'undefined') {
+                UiLog.push('ws.close', {
+                    session: this.sessionId,
                     code: event.code,
-                    reason: event.reason,
-                    wasClean: event.wasClean,
+                    reason: String(event.reason || ''),
+                    clean: !!event.wasClean,
+                    disposed: !!this._disposed,
                 });
             }
             if (!this._disposed) {
@@ -359,9 +394,7 @@ class TerminalInstance {
             this._wsConnected = false;
             this.alive = false;
             this._sawDisconnect = true;
-            if (window.console && typeof window.console.warn === 'function') {
-                window.console.warn(`Terminal WebSocket error for ${this.sessionId}`);
-            }
+            if (typeof UiLog !== 'undefined') UiLog.push('ws.error', { session: this.sessionId });
             this._scheduleReconnect();
         };
     }
@@ -471,12 +504,39 @@ class TerminalInstance {
         return 'fresh';
     }
 
+    /** Resize xterm to its container. Instrumented: a fit that lands on the wrong cols/rows
+     * (container mid-transition, hidden pane, zero-ish box) is the prime suspect for the
+     * "layout breaks until I switch tabs" bug, and the numbers are gone by the time anyone
+     * asks. Logged only when the geometry CHANGES or looks suspicious — a line per
+     * ResizeObserver callback would be noise, and the IPC would cause its own jank. */
     fit() {
+        const before = { cols: this.term.cols, rows: this.term.rows };
+        let failed = '';
         try {
             this.fitAddon.fit();
         } catch (e) {
-            // ignore fit errors during init
+            failed = String((e && e.message) || e);
         }
+        try {
+            const box = this.container ? this.container.getBoundingClientRect() : null;
+            const w = box ? Math.round(box.width) : -1;
+            const h = box ? Math.round(box.height) : -1;
+            const changed = before.cols !== this.term.cols || before.rows !== this.term.rows;
+            const suspect = failed || w <= 0 || h <= 0 || this.term.cols < 20 || this.term.rows < 5;
+            if ((changed || suspect) && typeof UiLog !== 'undefined') {
+                UiLog.push(suspect ? 'fit.suspect' : 'fit', {
+                    session: this.sessionId,
+                    cols: this.term.cols, rows: this.term.rows,
+                    from: `${before.cols}x${before.rows}`,
+                    w, h,
+                    attached: !!(this.container && this.container.isConnected),
+                    active: !!(window.app && window.app.activeTerminalId === this.sessionId),
+                    hidden: typeof document !== 'undefined' ? !!document.hidden : false,
+                    ws: this.ws ? this.ws.readyState : -1,
+                    error: failed,
+                });
+            }
+        } catch (e) { /* instrumentation must never break fit */ }
     }
 
     focus() {
@@ -510,6 +570,7 @@ class TerminalInstance {
 
     dispose() {
         this._disposed = true;
+        clearInterval(this._rxTimer);
         this._reconnectController.cancel();
         this._wsGeneration += 1;
         clearTimeout(this._userScrollTimer);

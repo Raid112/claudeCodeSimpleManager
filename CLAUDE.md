@@ -24,14 +24,20 @@ pyinstaller ClaudeCodeLauncher.spec
 There is a small test suite (no linter configured):
 
 ```bash
-# Run the unit tests (plain Node, no test framework)
+# Run the unit tests (plain Node / plain python, no test framework)
 node tests/terminal-input.test.js
 node tests/teams-search.test.js
+node tests/uilog.test.js
+python tests/work_items_check.py
+python tests/ui_log_check.py
+# ...and the rest: every tests/*_check.py (python) and tests/*.test.js (node) is standalone
 ```
 
 `tests/terminal-input.test.js` covers `TerminalInput.prepareTerminalPaste()` and `prepareComposerMessage()` from `web/js/terminal-input.js`.
 
 `tests/teams-search.test.js` covers the message-picker helpers in `web/js/workitems.js` (search normalization, time labels, person aggregation, snippet) plus a stubbed-DOM smoke test of `_rows()` on the Mensagens segment.
+
+`tests/uilog.test.js` covers the `UiLog` buffer in `web/js/uilog.js` (nothing is lost before the bridge exists, a failed flush is re-queued in order).
 
 ## Architecture
 
@@ -62,6 +68,8 @@ node tests/teams-search.test.js
 12. **web/js/composer.js** — Multi-line message composer panel that sends input to the active terminal.
 
 13. **web/js/terminal-input.js** — Pure input-preparation helpers (`prepareTerminalPaste`, `prepareComposerMessage`); covered by `tests/terminal-input.test.js`.
+
+14. **terminal/ui_log.py + web/js/uilog.js** — Diagnostics log at `%LOCALAPPDATA%\ClaudeManager\logs\ui-YYYY-MM-DD.jsonl` (7 days). The frontend batches events (2s/50) through `Bridge.ui_log`; `PtySession.resize` writes from the Python side into the same file. Logged: `fit`/`fit.suspect` (geometry, container box, active/hidden), `resize.sent`/`resize.dropped`, `pty.resize`/`pty.resize.failed`, `ws.*`, `js.error`, `js.rejection`, window focus/visibility. This is the trail for the "terminal layout breaks until I switch tabs" bug. DevTools no longer opens on launch (set `CLAUDEMANAGER_DEBUG=1` for that); the 🩺 logs button in the title bar opens the folder.
 
 **Data flow:** User input → xterm.js → WebSocket → pywinpty → Claude CLI → pywinpty → WebSocket → xterm.js
 

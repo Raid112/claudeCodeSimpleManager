@@ -10,7 +10,7 @@ import time
 from urllib.parse import urlsplit
 import websockets
 
-from terminal.input_debug import log_input_boundary
+from terminal.input_debug import log_input_boundary, log_output_summary
 from terminal.pty_manager import PtyManager
 
 
@@ -233,10 +233,19 @@ class WebSocketServer:
 
     async def _pty_to_ws(self, session, websocket):
         """Read from PTY, send to WebSocket."""
+        sum_start, sum_chunks, sum_chars = time.monotonic(), 0, 0
         while True:
             try:
+                now = time.monotonic()
+                if sum_chunks and now - sum_start >= 2.0:
+                    log_output_summary(session.id, sum_chunks, sum_chars, now - sum_start)
+                    sum_start, sum_chunks, sum_chars = now, 0, 0
+                elif not sum_chunks:
+                    sum_start = now
                 data = session.read()
                 if data:
+                    sum_chunks += 1
+                    sum_chars += len(data)
                     log_input_boundary("pty->ws", data, session_id=session.id)
                     await websocket.send(data)
                 elif hasattr(session, "is_alive") and not session.is_alive:

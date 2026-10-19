@@ -132,6 +132,13 @@ class App {
         this.agentApprovals = new AgentApprovals(this, document.getElementById('agent-approvals'));
         const dailyBtn = document.getElementById('daily-btn');
         if (dailyBtn) dailyBtn.addEventListener('click', () => this.workItemsUI.openDaily());
+        // Sem DevTools aberto por padrão, a pasta de logs é a única porta de entrada do
+        // diagnóstico — deixá-la a um clique é o que faz o log ser usado quando o bug acontece.
+        const logsBtn = document.getElementById('logs-btn');
+        if (logsBtn) logsBtn.addEventListener('click', async () => {
+            if (typeof UiLog !== 'undefined') await UiLog.flush();
+            try { await window.pywebview.api.open_logs_dir(); } catch (e) {}
+        });
 
         // Add group is now the "＋ pasta" chip in the sidebar's Nova aba section.
         const addGroupBtn = document.getElementById('add-group-btn');
