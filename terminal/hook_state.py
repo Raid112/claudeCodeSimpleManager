@@ -68,38 +68,61 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _safe_log_event(session_id: str, event_name: str, tool_name: str | None, ts: float) -> None:
+def _safe_log_event(session_id: str, event_name: str, tool_name: str | None, ts: float,
+                    session_key: str | None = None) -> None:
     """Append the raw hook event to the work-items event log. Best-effort: a lazy
     import + broad catch keep hook_state independent of work_items and unbreakable
-    (this runs inside a hook process; a failure here must never abort the hook)."""
+    (this runs inside a hook process; a failure here must never abort the hook —
+    everything below, including the fallback key computation, stays inside the
+    try so nothing here can raise before the broad except catches it).
+
+    The event log is keyed by `session_key` (the stable, tab-lifetime manager
+    identity), not by the provider `session_id` — which the user can swap under
+    the same tab via /clear or /resume — so a partition and its records survive
+    that swap with no migration needed. `session_id` still rides along as
+    `claude_session_id` for consumers that need the current provider id.
+
+    Unmanaged sessions (no CLAUDEMANAGER_SESSION_KEY injected, e.g. a claude
+    session started outside this app's PTY spawn) have no session_key: fall back
+    to keying the log by the provider session_id itself, mirroring write_event's
+    own `tab_id or session_id` fallback for the state file, so an unmanaged
+    session still logs something instead of silently dropping the event."""
     try:
         from terminal import work_items
-        work_items.log_event(session_id, event_name, tool_name=tool_name, ts=ts)
+        key = session_key or session_id
+        work_items.log_event(key, event_name, tool_name=tool_name, ts=ts,
+                             claude_session_id=session_id)
     except Exception:
         pass
 
 
 def write_event(session_id: str, event_name: str, ts: float | None = None,
-                tool_name: str | None = None, tab_id: str | None = None) -> None:
+                tool_name: str | None = None, tab_id: str | None = None,
+                session_key: str | None = None) -> None:
     """Persist derived status for a hook event. Must never raise (callers are hooks).
 
     State is keyed by `tab_id` (the managed tab, stable while the terminal lives)
     when the hook knows it — NOT by session_id, which changes under the same tab on
     /clear or /resume. The current claude session_id rides along as a field so the
     backend can follow the switch (see PtyManager.get_all_sessions). Falls back to
-    session_id keying for unmanaged sessions (no CLAUDEMANAGER_TAB env)."""
+    session_id keying for unmanaged sessions (no CLAUDEMANAGER_TAB env). `session_key`
+    is the stable manager identity (CLAUDEMANAGER_SESSION_KEY); recorded as a field
+    so downstream consumers don't need to map tab_id -> session_key at read time."""
     if not session_id or not event_name:
         return
     if ts is None:
         ts = time.time()
-    _safe_log_event(session_id, event_name, tool_name, ts)
+    _safe_log_event(session_id, event_name, tool_name, ts, session_key)
     key = tab_id or session_id
     prev = read_state(key)
     prev_event = prev.get("event") if prev else None
     status = _derive_status(event_name, prev_event)
     if status is None:
         return
-    data = {"event": event_name, "status": status, "ts": ts, "session_id": session_id}
+    data = {
+        "event": event_name, "status": status, "ts": ts,
+        "session_id": session_id, "session_key": session_key,
+    }
     _atomic_write(state_path(key), json.dumps(data))
 
 

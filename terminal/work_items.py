@@ -6,16 +6,25 @@ style of hook_state.py (module functions, atomic temp+os.replace writes):
 
 - work_items.json  : snapshot {version, items[], session_links{}}. Rewritten on change. Never expires.
 - work_log.jsonl   : append, one line per work-item action. Low volume. Never expires.
-- events/events-YYYY-MM-DD-<sid>.jsonl : append, one line per hook event. One file PER SESSION per
-  day (Windows append is NOT atomic across processes — each hook is a separate main.py process, so a
+- events/events-YYYY-MM-DD-<session_key>.jsonl : append, one line per hook event. One file PER
+  session_key (the stable, tab-lifetime manager identity — see terminal/hook_state.py) per day
+  (Windows append is NOT atomic across processes — each hook is a separate main.py process, so a
   shared file loses lines). Per-session partitioning removes contention BETWEEN sessions; it does not
   fix contention WITHIN one session if Claude fires parallel tool-call hooks (concurrent PreToolUse
   processes append to the same file → burst line loss). Accepted: later audit tolerates a dropped
   line in a burst; no cross-process lock for a best-effort metadata log. Retained 60 days.
 
-The session<->work-item link and the per-session `archived` flag live in session_links here, NOT in
+  Keyed by session_key rather than the provider claude_session_id because the latter is mutable
+  (the user swaps it under the same tab via /clear or /resume) — session_key survives that swap
+  with no migration needed. claude_session_id still rides along as a field on every record.
+  Records written before this rekey use the old shape ({ts, session, event, tool}); read_events
+  normalizes those on read (see _normalize_event) instead of migrating the files.
+
+The session<->work-item link lives in session_links here, NOT in
 sessions.json — that file is rewritten wholesale by the frontend every 10s and would clobber them.
-The join key everywhere is the claude_session_id.
+session_links is keyed by whatever the frontend passed to link() — today that's
+claude_session_id for claude terminals (see app.js sessionLinkKeyOf) and session_key for other
+providers. Joins against the event log must therefore try both normalized fields.
 """
 
 import os
@@ -47,9 +56,9 @@ def _events_dir() -> Path:
     return d
 
 
-def _event_file(session_id: str, ts: float) -> Path:
+def _event_file(session_key: str, ts: float) -> Path:
     day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")  # LOCAL time (daily reasons in local days)
-    return _events_dir() / f"events-{day}-{session_id}.jsonl"
+    return _events_dir() / f"events-{day}-{session_key}.jsonl"
 
 
 # ---------- atomic write (same pattern as hook_state._atomic_write) ----------
@@ -414,26 +423,122 @@ def daily_digest(days: int = 2) -> list[dict]:
     return out
 
 
-# ---------- event log (metadata only; one file per session per day) ----------
-def log_event(session_id: str, event_name: str, tool_name: str | None = None,
-              ts: float | None = None) -> None:
-    """Append one hook event. Metadata only — never tool input (privacy: Q7)."""
-    if not session_id or not event_name:
+def resolve_work_item_id(session_links: dict, session_key: str | None,
+                         claude_session_id: str | None) -> str:
+    """Resolve a session identity to its linked Work Item id, or "" if none.
+
+    Shared join helper for the two consumers that stamp `work_item_id` onto a
+    normalized Hermes event: `agent_gateway`'s `GET /v1/events` route and
+    `hermes_events.HermesEventsPublisher`'s stamping path. Both must load
+    session_links once per batch (`load_store()` -- a full JSON parse) and
+    call this pure function once per event, not reload the store per event.
+
+    `session_links` is keyed by whatever the frontend passed to
+    link() -- claude_session_id for claude terminals,
+    session_key for other providers (see app.js sessionLinkKeyOf) -- so a
+    lookup must try both, session_key first (mirrors work_overview's existing
+    join, same rationale). Never raises: a caller
+    normalizing a batch of events must degrade to "" for one malformed entry
+    rather than fail the whole batch.
+    """
+    if not isinstance(session_links, dict):
+        return ""
+    for key in (session_key, claude_session_id):
+        if not key:
+            continue
+        entry = session_links.get(key)
+        if isinstance(entry, dict):
+            wi_id = entry.get("wi_id")
+            if isinstance(wi_id, str) and wi_id:
+                return wi_id
+    return ""
+
+
+# ---------- event log (metadata only; one file per session_key per day) ----------
+def log_event(session_key: str, event_name: str, tool_name: str | None = None,
+              ts: float | None = None, claude_session_id: str | None = None) -> None:
+    """Append one hook event, keyed by the stable session_key (tab-lifetime manager
+    identity), not the mutable provider claude_session_id — so the partition survives
+    /clear or /resume with no migration. claude_session_id rides along as a field for
+    consumers that need the current provider id. Metadata only — never tool input,
+    never prompt text (privacy: Q7)."""
+    if not session_key or not event_name:
         return
     if ts is None:
         ts = time.time()
-    rec = {"ts": ts, "session": session_id, "event": event_name, "tool": tool_name}
+    rec = {
+        "ts": ts,
+        "session_key": session_key,
+        "event": event_name,
+        "tool": tool_name,
+        "claude_session_id": claude_session_id,
+    }
     try:
-        with open(_event_file(session_id, ts), "a", encoding="utf-8") as f:
+        with open(_event_file(session_key, ts), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError:
         pass
 
 
+def _normalize_event(rec: dict) -> dict:
+    """Normalize one parsed event record to the current shape, tolerating records
+    written before the session_key rekey ({ts, session, event, tool}, where "session"
+    was the provider claude_session_id and session_key was unknown)."""
+    if "session_key" in rec:
+        rec.setdefault("claude_session_id", None)
+        return rec
+    return {
+        "ts": rec.get("ts"),
+        "session_key": None,
+        "claude_session_id": rec.get("session"),
+        "event": rec.get("event"),
+        "tool": rec.get("tool"),
+    }
+
+
+def _partition_overlaps(path: str, since: float | None, until: float | None) -> bool:
+    """Can `events-YYYY-MM-DD-<key>.jsonl` hold a record inside [since, until]?
+
+    The day in the filename is the LOCAL day of every ts inside it (see _event_file),
+    so the partition's own range is [local midnight of D, local midnight of D+1).
+    Skipping non-overlapping files is what keeps a tailing caller cheap: without it
+    the publisher re-parsed every retained partition on each poll (measured: 264 ms
+    of CPU to return 1 record across 97 files / 5.5 MB, down to ~100 ms with this
+    filter). Anything whose name does not parse is INCLUDED — a filter must never be
+    the reason an event disappears.
+
+    Deliberately NOT filtered by file mtime, which would cut the tail case to near
+    zero: mtime only bounds the newest ts inside if no producer ever logs a ts in
+    the future, and a clock adjustment (or a replayed/synthetic ts) would then drop
+    events silently. Losing a wake-up is worse than parsing a file."""
+    if since is None and until is None:
+        return True
+    parts = Path(path).stem.split("-")  # events, YYYY, MM, DD, <key...>
+    if len(parts) < 4:
+        return True
+    try:
+        day = datetime.strptime("-".join(parts[1:4]), "%Y-%m-%d")
+    except ValueError:
+        return True
+    start = day.timestamp()
+    end = (day + timedelta(days=1)).timestamp()
+    if since is not None and end <= since:
+        return False
+    if until is not None and start > until:
+        return False
+    return True
+
+
 def read_events(since: float | None = None, until: float | None = None) -> list[dict]:
-    """Glob + merge event partitions, tolerating half-written lines (Windows append)."""
+    """Glob + merge event partitions, tolerating half-written lines (Windows append)
+    and old-shape records from before the session_key rekey (see _normalize_event).
+
+    Partitions whose day cannot contain a record in range are skipped without being
+    opened (see _partition_overlaps)."""
     out: list[dict] = []
     for fp in glob.glob(str(_events_dir() / "events-*.jsonl")):
+        if not _partition_overlaps(fp, since, until):
+            continue
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 for line in f:
@@ -444,6 +549,9 @@ def read_events(since: float | None = None, until: float | None = None) -> list[
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue  # skip corrupt line, keep the good ones
+                    if not isinstance(rec, dict):
+                        continue  # skip a validly-parsed non-object line (e.g. a bare number)
+                    rec = _normalize_event(rec)
                     t = rec.get("ts", 0)
                     if since is not None and t < since:
                         continue
@@ -486,7 +594,11 @@ def work_overview(days: int = 2) -> dict:
     ), default=None)
     if since is not None:
         for rec in read_events(since=since):
-            wi_id = session_to_wi.get(rec.get("session"))
+            # session_links may be keyed by session_key (other providers) or by
+            # claude_session_id (claude terminals keep their pre-existing key, see
+            # app.js sessionLinkKeyOf) — try both normalized fields from the event.
+            wi_id = (session_to_wi.get(rec.get("session_key"))
+                     or session_to_wi.get(rec.get("claude_session_id")))
             if wi_id in waiting_ids:
                 last_by_wi[wi_id] = max(last_by_wi[wi_id], rec.get("ts") or 0)
     waiting = [{

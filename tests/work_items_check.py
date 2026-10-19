@@ -82,13 +82,20 @@ def main() -> int:
         work_items.unlink("sid-AAA")
         check("4 unlink remove", "sid-AAA" not in work_items.load_store()["session_links"])
 
-        # 5. event log: 2 sessões -> 2 arquivos; metadado só
-        work_items.log_event("sid-1", "PreToolUse", tool_name="Bash")
+        # 5. event log: 2 sessões -> 2 arquivos; metadado só; keyed por session_key,
+        # claude_session_id junto como campo (Task 4: rekey do event log)
+        work_items.log_event("sid-1", "PreToolUse", tool_name="Bash", claude_session_id="csid-1")
         work_items.log_event("sid-2", "Stop")
         files = list(work_items._events_dir().glob("events-*.jsonl"))
         check("5 dois arquivos por sessão", len(files) == 2, str([f.name for f in files]))
         evs = work_items.read_events()
-        check("5 metadado só (sem input)", all(set(e.keys()) == {"ts", "session", "event", "tool"} for e in evs))
+        check("5 metadado só (sem input)",
+              all(set(e.keys()) == {"ts", "session_key", "event", "tool", "claude_session_id"}
+                  for e in evs))
+        check("5 session_key vira nome do arquivo",
+              any(f.name.endswith("-sid-1.jsonl") for f in files))
+        check("5 claude_session_id propagado",
+              any(e["session_key"] == "sid-1" and e["claude_session_id"] == "csid-1" for e in evs))
 
         # 6. tolera linha corrompida
         f1 = next(f for f in files)
@@ -97,10 +104,17 @@ def main() -> int:
         good = work_items.read_events()
         check("6 pula corrompida, mantém boas", len(good) >= 2)
 
-        # 7. gc_events apaga velho, mantém hoje
+        # 7. registro de formato antigo ({session}, sem session_key) ainda é lido e
+        # normalizado: session vira claude_session_id, session_key fica None
         old_day = (datetime.now() - timedelta(days=70)).strftime("%Y-%m-%d")
         old = work_items._events_dir() / f"events-{old_day}-sidX.jsonl"
         old.write_text('{"ts":0,"session":"sidX","event":"Stop","tool":null}\n', encoding="utf-8")
+        old_rec = next(e for e in work_items.read_events() if e.get("claude_session_id") == "sidX")
+        check("7 formato antigo normaliza p/ claude_session_id",
+              old_rec["claude_session_id"] == "sidX" and old_rec["session_key"] is None)
+
+        # gc_events apaga partição velha (nome de arquivo continua events-YYYY-MM-DD-<chave>,
+        # a chave agora é semanticamente session_key mas o parsing do nome não mudou)
         work_items.gc_events(max_age_days=60)
         check("7 gc apaga > 60d", not old.exists())
         check("7 gc mantém hoje", len(list(work_items._events_dir().glob("events-*.jsonl"))) >= 2)
@@ -120,11 +134,15 @@ def main() -> int:
               any(r["kind"] == "duedate" and r.get("detail", {}).get("to") == "2026-07-27"
                   for r in _read_work_log()))
 
-        # 10. hook enxerto: write_event grava no event log (metadado + tool)
+        # 10. hook enxerto: write_event grava no event log (metadado + tool). Sem
+        # session_key (chamada sem CLAUDEMANAGER_SESSION_KEY), cai no fallback:
+        # chave = session_id, e claude_session_id = mesmo valor.
         hook_state.write_event("sid-hook", "PreToolUse", tool_name="Edit")
-        hooked = [e for e in work_items.read_events() if e["session"] == "sid-hook"]
+        hooked = [e for e in work_items.read_events() if e["session_key"] == "sid-hook"]
         check("10 write_event grava evento", len(hooked) == 1)
         check("10 tool_name propagado", hooked and hooked[0]["tool"] == "Edit")
+        check("10 fallback: claude_session_id == session_key sem CLAUDEMANAGER_SESSION_KEY",
+              hooked and hooked[0]["claude_session_id"] == "sid-hook")
 
         # 11. atomic: sem .tmp sobrando
         tmps = list(work_items.get_data_dir().glob("*.tmp"))
@@ -188,6 +206,36 @@ def main() -> int:
               and waiting_row["waiting_since"] == wait_ts
               and waiting_row["last_activity"] >= event_ts)
 
+        # 15b. regressão do work_overview join (Task 4 passo 4): session_links pode
+        # estar keyed por session_key OU por claude_session_id (ver sessionLinkKeyOf
+        # em app.js: abas claude preferem claude_session_id). O join precisa tentar
+        # os dois campos normalizados do evento, não só session_key. ts no futuro +
+        # igualdade exata: nada do work_log (create/link/wait, todos com ts~=now)
+        # pode alcançar esse valor, então só o loop de read_events prova o join.
+        past = time.time() - 3600
+        future = time.time() + 600
+
+        # (a) link keyed por session_key (provider não-claude)
+        wi_a = work_items.new_item("manual", "join via session_key", ts=past)
+        work_items.set_waiting(wi_a["id"], True, ts=past)
+        work_items.link("skey-a", wi_a["id"])
+        work_items.log_event("skey-a", "Stop", ts=future)
+        row_a = next((i for i in work_items.work_overview(days=2)["waiting"]
+                      if i["wi_id"] == wi_a["id"]), None)
+        check("15b join via session_key", row_a is not None and row_a["last_activity"] == future)
+
+        # (b) link keyed por claude_session_id (claude terminal); o evento carrega um
+        # session_key DIFERENTE — só resolve pelo fallback claude_session_id. Sem o
+        # `or session_to_wi.get(rec.get("claude_session_id"))` no join, isto falha.
+        wi_b = work_items.new_item("manual", "join via claude_session_id", ts=past)
+        work_items.set_waiting(wi_b["id"], True, ts=past)
+        work_items.link("csid-b", wi_b["id"])
+        work_items.log_event("skey-b-different", "Stop", ts=future, claude_session_id="csid-b")
+        row_b = next((i for i in work_items.work_overview(days=2)["waiting"]
+                      if i["wi_id"] == wi_b["id"]), None)
+        check("15b join via claude_session_id (fallback)",
+              row_b is not None and row_b["last_activity"] == future)
+
         # 16. bridge expõe o lifecycle sem duplicar regra de negócio no frontend.
         check("16 bridge expõe waiting", hasattr(Bridge, "set_work_item_waiting"))
         check("16 bridge expõe reopen", hasattr(Bridge, "reopen_work_item"))
@@ -206,6 +254,53 @@ def main() -> int:
         canonical_daily = next((i for i in today if i["wi_id"] == waiting["id"]), None)
         check("17 histórico consolidado cai no canônico",
               canonical_daily is not None and "complete" in canonical_daily["kinds"])
+
+        # 18. resolve_work_item_id (Task 4 join helper shared by GET /v1/events
+        # and the Hermes publisher): tries session_key first, falls back to
+        # claude_session_id, degrades to "" -- never raises on garbage input.
+        work_items.link("skey-join-a", j["id"])
+        links = work_items.load_store()["session_links"]
+        check("18 resolves via session_key",
+              work_items.resolve_work_item_id(links, "skey-join-a", None) == j["id"])
+        check("18 falls back to claude_session_id when session_key misses",
+              work_items.resolve_work_item_id(links, "no-such-key", "skey-join-a") == j["id"])
+        check("18 session_key wins when both would match (checked via priority, not collision)",
+              work_items.resolve_work_item_id(links, "skey-join-a", "does-not-exist") == j["id"])
+        check("18 unknown identity degrades to ''",
+              work_items.resolve_work_item_id(links, "nope", "nope-either") == "")
+        check("18 both identities missing/falsy -> ''",
+              work_items.resolve_work_item_id(links, None, None) == "")
+        check("18 non-dict session_links never raises",
+              work_items.resolve_work_item_id(None, "skey-join-a", None) == "")
+
+        # ---- 16: read_events skips partitions whose day cannot match ----
+        # A tailing caller (the wake-up publisher, every 10s) must not re-parse the
+        # whole retained log. Correctness first: the filter may never be the reason
+        # an event disappears, including for a filename it cannot parse.
+        now = time.time()
+        work_items.log_event("skey-part-old", "Stop", ts=now - 86400 * 5)
+        work_items.log_event("skey-part-new", "Stop", ts=now)
+        tail_keys = [r["session_key"] for r in work_items.read_events(since=now - 60)
+                     if str(r.get("session_key", "")).startswith("skey-part-")]
+        check("16 tail lê só a partição do dia em janela", tail_keys == ["skey-part-new"], tail_keys)
+
+        all_keys = {r["session_key"] for r in work_items.read_events()
+                    if str(r.get("session_key", "")).startswith("skey-part-")}
+        check("16 sem since lê todas as partições",
+              all_keys == {"skey-part-old", "skey-part-new"}, all_keys)
+
+        past = [r["session_key"] for r in
+                work_items.read_events(since=now - 86400 * 6, until=now - 86400 * 4)
+                if str(r.get("session_key", "")).startswith("skey-part-")]
+        check("16 janela só no passado exclui a de hoje", past == ["skey-part-old"], past)
+
+        weird = work_items._events_dir() / "events-nao-uma-data.jsonl"
+        weird.write_text(json.dumps({
+            "ts": now, "session_key": "skey-part-weird", "event": "Stop", "tool": None,
+        }) + "\n", encoding="utf-8")
+        check("16 nome de partição inválido é INCLUÍDO, nunca descartado",
+              any(r.get("session_key") == "skey-part-weird"
+                  for r in work_items.read_events(since=now - 60)))
 
         print(f"\n{_passed} passed, {_failed} failed")
         return 1 if _failed else 0

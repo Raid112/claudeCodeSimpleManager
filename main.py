@@ -43,13 +43,17 @@ def _run_hook_notify():
 
         raw = _read_hook_stdin()
         payload = json.loads(raw) if raw.strip() else {}
-        # CLAUDEMANAGER_TAB is injected into the pty env at spawn (pty_manager) and
-        # inherited down powershell -> claude -> this hook. It identifies the tab
-        # regardless of how many /clear or /resume swapped the session_id underneath.
+        # CLAUDEMANAGER_TAB and CLAUDEMANAGER_SESSION_KEY are injected into the pty
+        # env at spawn (pty_manager.build_child_env) and inherited down
+        # powershell -> claude -> this hook. tab_id identifies the tab regardless of
+        # how many /clear or /resume swapped the session_id underneath; session_key
+        # is the same stable identity recorded directly, so no tab_id -> session_key
+        # mapping is needed when this event is read back.
         tab_id = os.environ.get("CLAUDEMANAGER_TAB")
+        session_key = os.environ.get("CLAUDEMANAGER_SESSION_KEY")
         # tool_name is only present on Pre/PostToolUse payloads; None elsewhere.
         write_event(payload.get("session_id"), payload.get("hook_event_name"),
-                    tool_name=payload.get("tool_name"), tab_id=tab_id)
+                    tool_name=payload.get("tool_name"), tab_id=tab_id, session_key=session_key)
     except Exception:
         pass
     sys.exit(0)
