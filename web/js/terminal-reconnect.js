@@ -9,8 +9,8 @@
 
             this._onAttempt = onAttempt;
             this._delays = [...(options.delays || DEFAULT_DELAYS_MS)];
-            this._setTimeout = options.setTimeoutFn || global.setTimeout;
-            this._clearTimeout = options.clearTimeoutFn || global.clearTimeout;
+            this._setTimeout = options.setTimeoutFn || global.setTimeout.bind(global);
+            this._clearTimeout = options.clearTimeoutFn || global.clearTimeout.bind(global);
             this._timer = null;
             this._attempt = 0;
             this._cancelled = false;
