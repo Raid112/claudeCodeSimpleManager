@@ -442,7 +442,11 @@ class PtyManager:
             if cur and cur != s.claude_session_id:
                 try:
                     from terminal import work_items
-                    work_items.migrate_link(s.claude_session_id, cur)
+                    # Aba claude vinculada antes de ter session_id foi gravada pela
+                    # session_key (app.js sessionLinkKeyOf); sem isso o vínculo se perdia.
+                    old = s.claude_session_id or (
+                        s.session_key if s.terminal_type == "claude" else None)
+                    work_items.migrate_link(old, cur)
                 except Exception:
                     pass
                 s.claude_session_id = cur

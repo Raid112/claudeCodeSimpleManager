@@ -32,13 +32,31 @@ import json
 import time
 import uuid
 import glob
+import functools
+import threading
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from terminal.hook_state import get_data_dir
 
 SCHEMA_VERSION = 1
 _SORT_STEP = 1000.0
+
+# Every mutator below is load_store() -> mutate -> save_store(), and save_store rewrites the
+# WHOLE file. Two of them interleaving means the slower one's stale snapshot wins and the
+# other's change silently disappears -- e.g. the wake poll (a timer, not a click) landing on
+# top of the item the user just completed. One process-wide RLock serializes the whole
+# read-modify-write, and is reentrant so a mutator may call another.
+_MUTEX = threading.RLock()
+
+
+def _serialized(fn):
+    """Run `fn` holding the store lock. On every function that writes work_items.json."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _MUTEX:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 # ---------- paths ----------
@@ -64,9 +82,27 @@ def _event_file(session_key: str, ts: float) -> Path:
 # ---------- atomic write (same pattern as hook_state._atomic_write) ----------
 def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_name(f"{path.stem}.{uuid.uuid4().hex}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        # Windows: os.replace falha com PermissionError enquanto outro handle (um leitor
+        # sem o lock) está com o destino aberto. Tenta de novo um pouco antes de desistir.
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+_LOAD_FAILED = "_load_failed"
 
 
 def _empty_store() -> dict:
@@ -78,20 +114,53 @@ def load_store() -> dict:
     try:
         with open(_store_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         return _empty_store()
+    except (json.JSONDecodeError, OSError):
+        # Arquivo existe mas não deu pra ler (replace concorrente, lock do Windows). Leitor
+        # recebe vazio como antes, mas o marcador impede que um mutador salve esse vazio
+        # por cima do store real — antes isso apagava todos os itens e links.
+        store = _empty_store()
+        store[_LOAD_FAILED] = True
+        return store
     # forward-compat backfill
     data.setdefault("version", SCHEMA_VERSION)
     data.setdefault("items", [])
     data.setdefault("session_links", {})
     for it in data["items"]:
-        it.setdefault("archived", False)  # forward-compat: items created before archiving
         it.setdefault("workflow_state", "active")
         it.setdefault("waiting_since", None)
+        _migrate_item_archived(it)
+    for entry in data["session_links"].values():
+        # A link only ever got archived_before_waiting because set_waiting() used to
+        # cascade onto links. Waiting is a render-time partition now, so restore the
+        # flag the user actually set and drop the bookkeeping.
+        entry.pop("archived_before_waiting", None)
+        # Aba não tem estado próprio: ela segue o estado da task (ativa → barra, aguardando
+        # → sidebar, concluída → fechada). O antigo "aba escondida" some na leitura.
+        entry.pop("archived", None)
     return data
 
 
+def _migrate_item_archived(it: dict) -> None:
+    """Collapse the old item-level `archived` flag into workflow_state.
+
+    "Archived" and "waiting" were two names for one thing (park it, I have nothing to do
+    until something comes back), with different side effects -- which is why the same item
+    could be hidden in two places and why bridge.py needed archived-insensitive joins.
+    An item that carried archived becomes `waiting`; the field is dropped. Idempotent: a
+    no-op once migrated, so it can live in load_store()."""
+    if "archived" not in it:
+        return
+    was_archived = bool(it.pop("archived"))
+    if was_archived and not it.get("done") and it.get("workflow_state") != "waiting":
+        it["workflow_state"] = "waiting"
+        it["waiting_since"] = it.get("waiting_since") or time.time()
+
+
 def save_store(store: dict) -> None:
+    if store.get(_LOAD_FAILED):
+        raise OSError("work_items.json não pôde ser lido; recusando sobrescrever com store vazio")
     _atomic_write(_store_path(), json.dumps(store, ensure_ascii=False, indent=2))
 
 
@@ -103,6 +172,7 @@ def _find(store: dict, wi_id: str) -> dict | None:
     return next((it for it in store["items"] if it["id"] == wi_id), None)
 
 
+@_serialized
 def new_item(source: str, title: str, external_key: str | None = None,
              external_url: str | None = None, status: str | None = None,
              duedate: str | None = None, duedate_has_time: bool = False,
@@ -134,7 +204,6 @@ def new_item(source: str, title: str, external_key: str | None = None,
         "person": person,
         "sort_order": max_order + _SORT_STEP,
         "done": False,
-        "archived": False,
         "workflow_state": "active",
         "waiting_since": None,
         "created_at": ts,
@@ -149,6 +218,7 @@ def new_item(source: str, title: str, external_key: str | None = None,
     return item
 
 
+@_serialized
 def rename_item(wi_id: str, title: str, ts: float | None = None) -> dict | None:
     """Rename a work item's title. Returns the updated item (or None if not found)."""
     if ts is None:
@@ -167,6 +237,7 @@ def rename_item(wi_id: str, title: str, ts: float | None = None) -> dict | None:
     return it
 
 
+@_serialized
 def complete_item(wi_id: str, ts: float | None = None) -> None:
     if ts is None:
         ts = time.time()
@@ -176,12 +247,16 @@ def complete_item(wi_id: str, ts: float | None = None) -> None:
         return
     it["done"] = True
     it["closed_at"] = ts
+    # Concluído não está mais esperando ninguém: sem isso o item ficava done+waiting.
+    it["workflow_state"] = "active"
+    it["waiting_since"] = None
     save_store(store)
     log_action("complete", wi=wi_id)
 
 
+@_serialized
 def reopen_item(wi_id: str, ts: float | None = None) -> dict | None:
-    """Return a completed or archived item to the active queue."""
+    """Return a completed or parked item to the active queue."""
     if ts is None:
         ts = time.time()
     store = load_store()
@@ -190,65 +265,132 @@ def reopen_item(wi_id: str, ts: float | None = None) -> dict | None:
         return None
     it["done"] = False
     it["closed_at"] = None
-    it["archived"] = False
     it["workflow_state"] = "active"
     it["waiting_since"] = None
-    for link in store["session_links"].values():
-        if link.get("wi_id") == wi_id:
-            link["archived"] = False
-            link.pop("archived_before_waiting", None)
+    it.pop("woke_at", None)
+    it.pop("woke_by", None)
     save_store(store)
     log_action("reopen", wi=wi_id, ts=ts)
     return it
 
 
+@_serialized
 def set_waiting(wi_id: str, waiting: bool = True, ts: float | None = None) -> dict | None:
-    """Park/unpark an item while keeping its linked PTY sessions alive."""
+    """Park/unpark an item. Parked ("waiting") means: I answered, nothing is expected from me
+    until the other side comes back. Its tabs stay alive and the sidebar renders them under the
+    item's own section -- so this writes NOTHING onto session_links. It used to flip
+    link["archived"] on every link (plus an archived_before_waiting memo to undo it), which is
+    what made "arquivar" and "aguardar" behave like two half-working versions of one idea and
+    forced the archived-insensitive joins in api/bridge.py."""
     if ts is None:
         ts = time.time()
     store = load_store()
     it = _find(store, wi_id)
-    if not it or it.get("done") or it.get("archived"):
+    if not it or it.get("done"):
         return it
     was_waiting = it.get("workflow_state") == "waiting"
     it["workflow_state"] = "waiting" if waiting else "active"
-    if waiting:
-        if not was_waiting or not it.get("waiting_since"):
-            it["waiting_since"] = ts
-    else:
+    if not waiting:
         it["waiting_since"] = None
-    for link in store["session_links"].values():
-        if link.get("wi_id") != wi_id:
-            continue
-        if waiting:
-            link.setdefault("archived_before_waiting", bool(link.get("archived")))
-            link["archived"] = True
-        else:
-            link["archived"] = bool(link.pop("archived_before_waiting", False))
+    elif not was_waiting or not it.get("waiting_since"):
+        it["waiting_since"] = ts  # re-parking an already-parked item keeps the original clock
+    it.pop("woke_at", None)
+    it.pop("woke_by", None)
     save_store(store)
     if was_waiting != waiting:
         log_action("wait" if waiting else "resume", wi=wi_id, ts=ts)
     return it
 
 
-def set_item_archived(wi_id: str, archived: bool = True, ts: float | None = None) -> None:
-    """Archive/unarchive a WHOLE work item and cascade the flag to its linked sessions, so the
-    item's tabs vanish from the tab bar + sidebar together (not orphaned to Avulso). Reversible.
-    Distinct from complete_item (done): archiving hides without marking the work finished."""
-    if ts is None:
-        ts = time.time()
+@_serialized
+def ack_wake(wi_id: str) -> None:
+    """Clear the "they answered" badge once the user has looked at the item. Not a state
+    change (the item is already active) -- just marks the notice as seen."""
     store = load_store()
     it = _find(store, wi_id)
-    if not it:
+    if not it or "woke_at" not in it:
         return
-    it["archived"] = archived
-    for link in store["session_links"].values():
-        if link.get("wi_id") == wi_id:
-            link["archived"] = archived or it.get("workflow_state") == "waiting"
+    it.pop("woke_at", None)
+    it.pop("woke_by", None)
     save_store(store)
-    log_action("archive_item" if archived else "unarchive_item", wi=wi_id)
 
 
+# ---------- wake on reply (Teams) ----------
+def teams_chat_id(it: dict) -> str | None:
+    """chat_id out of a teams external_key ("teams:{chat_id}:{msg_id}"). None for any other
+    source, or for teams items created before message ids were persisted -- those simply
+    can't be woken automatically."""
+    key = it.get("external_key") or ""
+    if it.get("source") != "teams" or not key.startswith("teams:"):
+        return None
+    parts = key.split(":")
+    return parts[1] if len(parts) >= 3 and parts[1] else None
+
+
+def _iso_ts(value) -> float | None:
+    """Graph createdDateTime ('2026-09-17T12:34:56.789Z') -> epoch seconds. None if unusable."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    txt = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # Graph normally sends 'Z', but a payload without an offset would otherwise be read
+        # as LOCAL time -- three hours in the past here, which puts a real reply before
+        # waiting_since and the item never wakes up. Graph timestamps are UTC, so say so.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+@_serialized
+def wake_on_reply(chats: list[dict], now: float | None = None) -> list[dict]:
+    """Unpark waiting Teams items whose chat got a message from the OTHER side after the item
+    was parked, and return the items that woke up.
+
+    `chats` is teams_graph.list_recent()'s shape: {chat_id, messages: [{sender_name, text, ts}]}
+    where `messages` already excludes my own (list_recent filters from_me) -- so my own
+    follow-up never wakes my own item. Compared strictly against waiting_since, so the very
+    message that created the item can't wake it. Pure over its argument and idempotent: an
+    item that woke is active, hence no longer a candidate.
+
+    Only teams items are wakeable. A Jira or manual item parked on "waiting" has no reply
+    signal to listen to; those stay manual-unpark."""
+    if now is None:
+        now = time.time()
+    by_chat = {c.get("chat_id"): c for c in (chats or []) if c.get("chat_id")}
+    if not by_chat:
+        return []
+    store = load_store()
+    woken = []
+    for it in store["items"]:
+        if it.get("done") or it.get("merged_into") or it.get("workflow_state") != "waiting":
+            continue
+        chat_id = teams_chat_id(it)
+        chat = by_chat.get(chat_id) if chat_id else None
+        if not chat:
+            continue
+        since = it.get("waiting_since") or 0
+        reply = next((m for m in (chat.get("messages") or [])
+                      if (_iso_ts(m.get("ts")) or 0) > since), None)
+        if not reply:
+            continue
+        it["workflow_state"] = "active"
+        it["waiting_since"] = None
+        it["woke_at"] = now
+        it["woke_by"] = reply.get("sender_name") or it.get("person") or ""
+        woken.append(it)
+        log_action("wake", wi=it["id"], ts=now,
+                   detail={"by": it["woke_by"], "preview": (reply.get("text") or "")[:120]})
+    if woken:
+        save_store(store)
+    return woken
+
+
+@_serialized
 def reorder(ordered_ids: list[str]) -> None:
     """Rewrite sort_order to match the given order. NOT logged (view preference, not a work fact)."""
     store = load_store()
@@ -259,6 +401,7 @@ def reorder(ordered_ids: list[str]) -> None:
     save_store(store)
 
 
+@_serialized
 def apply_jira_snapshot(wi_id: str, status: str | None, duedate: str | None,
                         ts: float | None = None) -> None:
     """Diff a freshly fetched Jira status/duedate against jira_last_seen; log status/duedate
@@ -281,6 +424,7 @@ def apply_jira_snapshot(wi_id: str, status: str | None, duedate: str | None,
 
 
 # ---------- session <-> item link (durable; NOT in sessions.json) ----------
+@_serialized
 def link(claude_session_id: str, wi_id: str, group_name: str | None = None,
          path: str | None = None, name: str | None = None) -> None:
     if not claude_session_id or not wi_id:
@@ -288,9 +432,8 @@ def link(claude_session_id: str, wi_id: str, group_name: str | None = None,
     store = load_store()
     entry = store["session_links"].get(claude_session_id, {})
     entry.update({"wi_id": wi_id, "ts": time.time()})
-    entry.setdefault("archived", False)
     # Directory hints let "nova aba nesta issue" reopen in the same folder, and let the
-    # archived list show a session without a live terminal. Only overwrite when provided.
+    # sidebar name a session without a live terminal. Only overwrite when provided.
     if group_name is not None:
         entry["group_name"] = group_name
     if path is not None:
@@ -302,6 +445,7 @@ def link(claude_session_id: str, wi_id: str, group_name: str | None = None,
     log_action("link", wi=wi_id, session=claude_session_id)
 
 
+@_serialized
 def unlink(claude_session_id: str) -> None:
     store = load_store()
     entry = store["session_links"].pop(claude_session_id, None)
@@ -311,6 +455,7 @@ def unlink(claude_session_id: str) -> None:
     log_action("unlink", wi=entry.get("wi_id"), session=claude_session_id)
 
 
+@_serialized
 def migrate_link(old_sid: str, new_sid: str) -> None:
     """Re-key a session's link/archived entry when the claude session_id changes
     under the same tab (user ran /clear or /resume). No-op if there's nothing to
@@ -326,14 +471,6 @@ def migrate_link(old_sid: str, new_sid: str) -> None:
     del links[old_sid]
     save_store(store)
     log_action("migrate", wi=entry.get("wi_id"), session=new_sid, detail={"from": old_sid})
-
-
-def set_archived(claude_session_id: str, archived: bool = True) -> None:
-    store = load_store()
-    entry = store["session_links"].setdefault(claude_session_id, {"wi_id": None})
-    entry["archived"] = archived
-    save_store(store)
-    log_action("archive" if archived else "unarchive", session=claude_session_id)
 
 
 # ---------- work log (low volume, never expires) ----------
@@ -570,9 +707,7 @@ def work_overview(days: int = 2) -> dict:
     items = store.get("items", [])
     waiting_items = [
         it for it in items
-        if not it.get("done")
-        and not it.get("archived")
-        and it.get("workflow_state") == "waiting"
+        if not it.get("done") and it.get("workflow_state") == "waiting"
     ]
     last_by_wi = {
         it["id"]: max(it.get("created_at") or 0, it.get("waiting_since") or 0)
@@ -617,9 +752,7 @@ def work_overview(days: int = 2) -> dict:
     )
     active_count = sum(
         1 for it in items
-        if not it.get("done")
-        and not it.get("archived")
-        and it.get("workflow_state") != "waiting"
+        if not it.get("done") and it.get("workflow_state") != "waiting"
     )
     return {
         "days": digest,
@@ -632,6 +765,7 @@ def work_overview(days: int = 2) -> dict:
     }
 
 
+@_serialized
 def gc_events(max_age_days: int = 60) -> None:
     """Delete event partitions whose day-in-name is older than max_age_days (local time)."""
     cutoff = (datetime.now() - timedelta(days=max_age_days)).date()

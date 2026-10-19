@@ -1,9 +1,14 @@
 /**
  * Sidebar — work-item-centric. Renders four sections:
  *   Trabalho  — work items (jira/teams/manual) with their live sessions nested
+ *   Aguardando — parked items: I answered, the ball is with the other side. Their tabs stay
+ *                alive (and out of the tab bar) until the item comes back — by hand, or on its
+ *                own when the person replies (terminal/work_items.wake_on_reply).
  *   Avulso    — live terminals not linked to any work item (incl. codex/--continue)
  *   Nova aba  — folder chips that launch a terminal (the old group launcher)
- *   Arquivado — session_links flagged archived (collapsed by default)
+ *
+ * Tab state is the task's state, for every tab of the task: active → top tab bar, aguardando →
+ * listed under the task here, concluída → closed. There is no per-tab hidden/archived state.
  *
  * Structure comes from app.workItems ({items, session_links}); live state (running/ready)
  * is joined in from get_terminals + the frontend TerminalInstance status. The join key is
@@ -24,9 +29,8 @@ function wiWaitingElapsed(tsSeconds, nowMs = Date.now()) {
 function wiPartitionWorkItems(items) {
     const open = (items || []).filter(it => !it.done && !it.merged_into);
     return {
-        active: open.filter(it => !it.archived && it.workflow_state !== 'waiting'),
-        waiting: open.filter(it => !it.archived && it.workflow_state === 'waiting'),
-        archived: open.filter(it => it.archived),
+        active: open.filter(it => it.workflow_state !== 'waiting'),
+        waiting: open.filter(it => it.workflow_state === 'waiting'),
     };
 }
 
@@ -36,7 +40,6 @@ class Sidebar {
         this.app = app;
         this.expandedGroups = new Set();      // legacy group expand (unused in chip mode)
         this._terminalType = 'claude';
-        this._archivedOpen = false;
         this._moreGroups = false;             // "Nova aba" chips: show all vs favourites
         this._dragId = null;                  // work item id being dragged (reorder)
     }
@@ -150,21 +153,12 @@ class Sidebar {
         const partition = wiPartitionWorkItems(allItems);
         const items = partition.active;
         const waitingItems = partition.waiting;
-        const archivedItems = partition.archived;
         items.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
         waitingItems.sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
 
-        // Map claude_session_id -> pty session id (live terminals only)
-        const liveByCsid = {};
-        for (const [ptyId, info] of Object.entries(this.app.terminals)) {
-            const key = this.app.sessionLinkKeyOf(ptyId);
-            if (key) liveByCsid[key] = ptyId;
-            if (info.claudeSessionId) liveByCsid[info.claudeSessionId] = ptyId;
-        }
-
         // Group live sessions: linked to an ACTIVE (non-done) item vs avulso.
         // A session linked to a done item, or whose item no longer exists, falls to avulso
-        // (never orphaned off-screen). Archived sessions belong only to the Arquivado section.
+        // (never orphaned off-screen).
         const activeItemIds = new Set(items.map(it => it.id));
         const waitingItemIds = new Set(waitingItems.map(it => it.id));
         const sessionsByItem = {};   // wi_id -> [{ptyId, csid}]
@@ -173,15 +167,15 @@ class Sidebar {
         for (const [ptyId, info] of Object.entries(this.app.terminals)) {
             const csid = this.app.sessionLinkKeyOf(ptyId);
             const legacyCsid = info.claudeSessionId || null;
-            const link = (csid && links[csid]) || (legacyCsid && links[legacyCsid]);
+            const link = this.app.linkOf ? this.app.linkOf(ptyId)
+                : ((csid && links[csid]) || (legacyCsid && links[legacyCsid]));
             if (link && link.wi_id && waitingItemIds.has(link.wi_id)) {
                 (sessionsByWaiting[link.wi_id] = sessionsByWaiting[link.wi_id] || [])
                     .push({ ptyId, csid: csid || legacyCsid });
                 continue;
             }
-            if (link && link.archived) continue;  // shown only under Arquivado
             if (link && link.wi_id && activeItemIds.has(link.wi_id)) {
-                (sessionsByItem[link.wi_id] = sessionsByItem[link.wi_id] || []).push({ ptyId, csid });
+                (sessionsByItem[link.wi_id] = sessionsByItem[link.wi_id] || []).push({ ptyId, csid: csid || legacyCsid });
             } else {
                 avulso.push({ ptyId, csid: csid || legacyCsid });
             }
@@ -192,7 +186,6 @@ class Sidebar {
         html += this._renderWaiting(waitingItems, sessionsByWaiting);
         html += this._renderAvulso(avulso);
         html += this._renderNovaAba(groups);
-        html += this._renderArchived(archivedItems, waitingItemIds, links, liveByCsid);
 
         this.container.innerHTML = html;
         this._renderTypeSelector();
@@ -216,23 +209,25 @@ class Sidebar {
             const due = this._dueInfo(it);
             const statusPill = it.source === 'jira' && it.status
                 ? `<span class="st">${this._esc(it.status)}</span>` : '';
-            const titleLine = it.source === 'teams'
-                ? this._esc(it.title)
-                : this._esc(it.title);
+            const titleLine = this._esc(it.title);
+            // Voltou sozinho porque a pessoa respondeu — o card precisa dizer isso, senão o
+            // item reaparece na lista sem explicação. Some no primeiro clique (ack).
+            const woke = it.woke_at
+                ? `<span class="wi-woke" title="voltou porque responderam">↩ ${this._esc(it.woke_by || 'respondeu')}</span>`
+                : '';
 
             const isLocked = this.app.lockedWiId === it.id;
             html += `<div class="wi ${hasRunning ? 'has-running' : ''} ${isLocked ? 'locked' : ''}" data-wi="${it.id}" draggable="true" style="--c:${color}">`;
             html += `<div class="wi-top" data-lockwi="${it.id}" title="${isLocked ? 'clique para destravar (mostra todas as abas)' : 'clique para travar: só as abas deste item ficam expandidas'}">`;
             html += `<span class="pri" title="arraste para repriorizar">${idx + 1}</span>`;
             html += `<div class="wi-body">`;
-            html += `<div class="l1"><span class="wi-key">${this._esc(this._keyLabel(it))}</span>${statusPill}`;
+            html += `<div class="l1"><span class="wi-key">${this._esc(this._keyLabel(it))}</span>${statusPill}${woke}`;
             html += `<span class="due ${due.cls}">${due.txt}</span></div>`;
             const renameAttr = (it.source === 'manual' || it.source === 'teams')
                 ? ` data-renamewi="${it.id}" title="duplo-clique para renomear"` : '';
             html += `<div class="wi-title"${renameAttr}>${titleLine}</div>`;
-            html += `</div><svg class="wi-wait" viewBox="0 0 20 20" title="aguardar resposta (esconde as abas, mantém o cache)" data-waitwi="${it.id}"><use href="#i-wait"/></svg>`;
-            html += `<svg class="wi-arch" viewBox="0 0 20 20" title="arquivar (esconde o item e suas abas)" data-archwi="${it.id}"><use href="#i-arch"/></svg>`;
-            html += `<svg class="wi-done" viewBox="0 0 20 20" title="concluir work item" data-complete="${it.id}"><use href="#i-check"/></svg>`;
+            html += `</div><svg class="wi-wait" viewBox="0 0 20 20" title="aguardar resposta (some da barra, mantém o cache; volta sozinho quando responderem)" data-waitwi="${it.id}"><use href="#i-wait"/></svg>`;
+            html += `<svg class="wi-done" viewBox="0 0 20 20" title="concluir work item (fecha todas as abas dele)" data-complete="${it.id}"><use href="#i-check"/></svg>`;
             html += `<span class="wi-dot ${dot}"></span></div>`;
 
             for (const s of sess) {
@@ -242,7 +237,7 @@ class Sidebar {
                 html += `<span class="dot ${this._dotClass(st)}"></span>`;
                 html += `<span class="nm" data-id="${s.ptyId}">${this._esc(this.app.getDisplayName(s.ptyId))}</span>`;
                 html += this._cacheTimer(s.ptyId);
-                html += `<svg class="arch" viewBox="0 0 20 20" data-arch="${s.csid}" title="arquivar aba"><use href="#i-arch"/></svg></div>`;
+                html += `</div>`;
             }
             const label = it.source === 'jira' ? '＋ nova aba nesta issue' : '＋ nova aba';
             html += `<div class="addSess" data-additem="${it.id}">${label}</div>`;
@@ -253,8 +248,8 @@ class Sidebar {
 
     _renderWaiting(items, sessionsByItem) {
         if (!items.length) return '';
-        let html = `<div class="sec-head waiting-head"><span class="caret">◆</span>Aguardando`
-            + `<span class="count">${items.length}</span></div>`;
+        let html = `<div class="sec-head waiting-head" title="respondi, a bola está com o outro lado">`
+            + `<span class="caret">◆</span>Aguardando<span class="count">${items.length}</span></div>`;
         for (const it of items) {
             const color = SRC_COLOR[it.source] || 'var(--t-todo)';
             const sess = sessionsByItem[it.id] || [];
@@ -264,12 +259,24 @@ class Sidebar {
             html += `<div class="wi-top">`;
             html += `<span class="wait-pulse d-waiting"></span>`;
             html += `<div class="wi-body"><div class="l1"><span class="wi-key">${this._esc(this._keyLabel(it))}</span>`;
-            html += `<span class="wait-label">aguardando</span><span class="wait-since">há ${since}</span></div>`;
+            const auto = it.source === 'teams' && (it.external_key || '').startsWith('teams:');
+            html += `<span class="wait-label" title="${auto ? 'volta sozinho quando a pessoa responder' : 'sem sinal de resposta: retome pela seta'}">`
+                + `${auto ? 'aguardando resposta' : 'aguardando'}</span><span class="wait-since">há ${since}</span></div>`;
             html += `<div class="wi-title">${this._esc(it.title)}</div>`;
             html += `<div class="wait-meta"><span>${tabs}</span>${this._waitingCacheSummary(sess)}</div></div>`;
-            html += `<svg class="wi-resume" viewBox="0 0 20 20" title="retomar e revelar abas" data-resumewi="${it.id}"><use href="#i-play"/></svg>`;
-            html += `<svg class="wi-arch" viewBox="0 0 20 20" title="arquivar de verdade" data-archwi="${it.id}"><use href="#i-arch"/></svg>`;
-            html += `</div></div>`;
+            html += `<svg class="wi-resume" viewBox="0 0 20 20" title="retomar agora (revela as abas)" data-resumewi="${it.id}"><use href="#i-play"/></svg>`;
+            html += `<svg class="wi-done" viewBox="0 0 20 20" title="concluir work item (fecha todas as abas dele)" data-complete="${it.id}"><use href="#i-check"/></svg>`;
+            html += `</div>`;
+            // As abas da task aguardando moram aqui. Abrir uma = retomar a task inteira.
+            for (const s of sess) {
+                const st = this._sessionStatus(s.ptyId);
+                html += `<div class="sess" data-resumetab="${s.ptyId}" data-resumewi-of="${it.id}" title="retomar a task (todas as abas voltam pra barra)">`;
+                html += `<span class="dot ${this._dotClass(st)}"></span>`;
+                html += `<span class="nm">${this._esc(this.app.getDisplayName(s.ptyId))}</span>`;
+                html += this._cacheTimer(s.ptyId);
+                html += `</div>`;
+            }
+            html += `</div>`;
         }
         return html;
     }
@@ -314,44 +321,6 @@ class Sidebar {
         return html;
     }
 
-    _renderArchived(archivedItems, waitingItemIds, links, liveByCsid) {
-        const archIds = new Set(archivedItems.map(it => it.id));
-        // Sessões arquivadas soltas = arquivadas individualmente (não via item arquivado, que já
-        // aparece como card). Evita mostrar a mesma aba duas vezes.
-        const looseSessions = Object.entries(links).filter(([, l]) =>
-            l.archived
-            && !(l.wi_id && archIds.has(l.wi_id))
-            && !(l.wi_id && waitingItemIds.has(l.wi_id)));
-        const count = archivedItems.length + looseSessions.length;
-        if (count === 0) return '';
-        let html = `<div class="sec-head" data-togglearch="1"><span class="caret">${this._archivedOpen ? '▼' : '▶'}</span>Arquivado<span class="count">${count}</span></div>`;
-        if (this._archivedOpen) {
-            // work items arquivados como cards — desarquivar traz de volta o item e suas abas
-            for (const it of archivedItems) {
-                const color = SRC_COLOR[it.source] || 'var(--t-todo)';
-                html += `<div class="wi" style="--c:${color}">`;
-                html += `<div class="wi-top"><span class="pri" style="opacity:.35">▤</span><div class="wi-body">`;
-                html += `<div class="l1"><span class="wi-key">${this._esc(this._keyLabel(it))}</span></div>`;
-                html += `<div class="wi-title">${this._esc(it.title)}</div></div>`;
-                html += `<svg class="wi-arch on" viewBox="0 0 20 20" title="desarquivar" data-unarchwi="${it.id}"><use href="#i-arch"/></svg>`;
-                html += `<span class="wi-dot d-stopped"></span></div>`;
-            }
-            // sessões arquivadas individualmente (fluxo antigo), soltas
-            if (looseSessions.length) {
-                html += `<div class="wi" style="--c:#2f2f38">`;
-                for (const [csid, l] of looseSessions) {
-                    const live = liveByCsid[csid];
-                    html += `<div class="sess" ${live ? `data-id="${live}"` : ''} style="padding-left:14px">`;
-                    html += `<span class="dot d-stopped"></span>`;
-                    html += `<span class="nm">${this._esc(l.name || csid.slice(0, 8))}</span>`;
-                    html += `<svg class="arch" viewBox="0 0 20 20" data-unarch="${csid}" title="desarquivar"><use href="#i-arch"/></svg></div>`;
-                }
-                html += `</div>`;
-            }
-        }
-        return html;
-    }
-
     // ---------- events ----------
     _bindEvents() {
         const q = sel => this.container.querySelectorAll(sel);
@@ -360,6 +329,12 @@ class Sidebar {
         q('.sess[data-id]').forEach(el => el.addEventListener('click', (e) => {
             if (e.target.closest('svg')) return;
             this.app.switchToTerminal(el.dataset.id);
+        }));
+
+        // aba de task aguardando: abrir = retomar a task e cair nessa aba
+        q('.sess[data-resumetab]').forEach(el => el.addEventListener('click', async () => {
+            await this.app.setWorkItemWaiting(el.dataset.resumewiOf, false);
+            this.app.switchToTerminal(el.dataset.resumetab);
         }));
 
         // rename via right-click on session name
@@ -390,22 +365,6 @@ class Sidebar {
             this.app.setWorkItemWaiting(el.dataset.resumewi, false);
         }));
 
-        // archive / unarchive a session
-        q('.arch[data-arch]').forEach(el => el.addEventListener('click', (e) => {
-            e.stopPropagation(); this.app.archiveSession(el.dataset.arch, true);
-        }));
-        q('.arch[data-unarch]').forEach(el => el.addEventListener('click', (e) => {
-            e.stopPropagation(); this.app.archiveSession(el.dataset.unarch, false);
-        }));
-
-        // archive / unarchive a whole work item (cascades to its tabs)
-        q('.wi-arch[data-archwi]').forEach(el => el.addEventListener('click', (e) => {
-            e.stopPropagation(); this.app.archiveWorkItem(el.dataset.archwi, true);
-        }));
-        q('.wi-arch[data-unarchwi]').forEach(el => el.addEventListener('click', (e) => {
-            e.stopPropagation(); this.app.archiveWorkItem(el.dataset.unarchwi, false);
-        }));
-
         // link an avulso session
         q('.arch[data-link]').forEach(el => el.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -415,8 +374,9 @@ class Sidebar {
         // clique no cabeçalho do card = trava/destrava a gaveta desse work item.
         // Ignora cliques nos ícones (arquivar/concluir) e no título (renomear).
         q('.wi-top[data-lockwi]').forEach(el => el.addEventListener('click', (e) => {
-            // .pri é a alça de arraste (repriorizar); svg são arquivar/concluir; .wi-title renomeia.
+            // .pri é a alça de arraste (repriorizar); svg são aguardar/concluir; .wi-title renomeia.
             if (e.target.closest('svg') || e.target.closest('.wi-title') || e.target.closest('.pri')) return;
+            this.app.ackWorkItemWake(el.dataset.lockwi);   // "↩ fulano respondeu" já foi visto
             this.app.toggleLockedItem(el.dataset.lockwi);
         }));
 
@@ -439,11 +399,6 @@ class Sidebar {
             this._moreGroups = true; this.render();
         }));
         q('.chip[data-addgroup]').forEach(el => el.addEventListener('click', () => this.app.addGroup()));
-
-        // archived section toggle
-        q('.sec-head[data-togglearch]').forEach(el => el.addEventListener('click', () => {
-            this._archivedOpen = !this._archivedOpen; this.render();
-        }));
 
         this._bindDrag();
     }

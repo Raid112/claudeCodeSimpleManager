@@ -13,7 +13,7 @@ import time
 import tempfile
 import shutil
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # import from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -77,8 +77,7 @@ def main() -> int:
         work_items.link("sid-AAA", b["id"])
         s = work_items.load_store()
         check("4 link em session_links", s["session_links"]["sid-AAA"]["wi_id"] == b["id"])
-        work_items.set_archived("sid-AAA", True)
-        check("4 archived flag", work_items.load_store()["session_links"]["sid-AAA"]["archived"] is True)
+        check("4 link sem estado próprio de aba", "archived" not in s["session_links"]["sid-AAA"])
         work_items.unlink("sid-AAA")
         check("4 unlink remove", "sid-AAA" not in work_items.load_store()["session_links"])
 
@@ -157,8 +156,9 @@ def main() -> int:
         check("12 external_key não duplica snapshot",
               len(work_items.list_items()) == before_dedup)
 
-        # 13. Aguardando é estado do item, não arquivo: esconde suas abas (preserva PTY/cache)
-        # e retomar revela as mesmas sessões.
+        # 13. Aguardando é o ÚNICO jeito de parar um item (não existe mais "arquivar item").
+        # É estado do item e nada mais: os vínculos das abas ficam intactos — quem esconde as
+        # abas é o render (sidebar/tab bar), não um flag copiado pra dentro de session_links.
         waiting = work_items.new_item(
             "teams", "esperando resposta", external_key="teams:chat-1:msg-1")
         work_items.link("sid-wait", waiting["id"], name="investigação")
@@ -169,9 +169,10 @@ def main() -> int:
         check("13 workflow_state=waiting",
               waiting_now["workflow_state"] == "waiting"
               and waiting_now["waiting_since"] == wait_ts)
-        check("13 abas ocultas sem remover vínculo",
+        check("13 aguardar não escreve em session_links",
               s["session_links"]["sid-wait"]["wi_id"] == waiting["id"]
-              and s["session_links"]["sid-wait"]["archived"] is True)
+              and "archived" not in s["session_links"]["sid-wait"]
+              and "archived_before_waiting" not in s["session_links"]["sid-wait"])
 
         work_items.set_waiting(waiting["id"], False)
         s = work_items.load_store()
@@ -179,8 +180,136 @@ def main() -> int:
         check("13 retomar volta active",
               waiting_now["workflow_state"] == "active"
               and waiting_now["waiting_since"] is None)
-        check("13 retomar revela mesmas abas",
-              s["session_links"]["sid-wait"]["archived"] is False)
+        check("13 retomar mantém o vínculo das abas",
+              s["session_links"]["sid-wait"]["wi_id"] == waiting["id"])
+
+        # 13b. Migração: item com o antigo `archived` vira waiting na leitura, e o antigo
+        # estado de aba escondida some (aba segue a task).
+        legacy = work_items.new_item("manual", "item legado arquivado")
+        work_items.link("sid-legacy", legacy["id"], name="aba legada")
+        raw = work_items.load_store()
+        next(i for i in raw["items"] if i["id"] == legacy["id"])["archived"] = True
+        raw["session_links"]["sid-legacy"]["archived"] = True
+        raw["session_links"]["sid-legacy"]["archived_before_waiting"] = False
+        work_items.save_store(raw)
+        migrated = work_items.load_store()
+        legacy_now = next(i for i in migrated["items"] if i["id"] == legacy["id"])
+        check("13b archived legado vira waiting",
+              legacy_now["workflow_state"] == "waiting"
+              and "archived" not in legacy_now
+              and legacy_now["waiting_since"])
+        check("13b flag de aba escondida some",
+              "archived" not in migrated["session_links"]["sid-legacy"]
+              and "archived_before_waiting" not in migrated["session_links"]["sid-legacy"])
+        work_items.save_store(migrated)
+        check("13b migração é idempotente",
+              next(i for i in work_items.load_store()["items"]
+                   if i["id"] == legacy["id"])["workflow_state"] == "waiting")
+        work_items.complete_item(legacy["id"])
+        done_now = next(i for i in work_items.load_store()["items"] if i["id"] == legacy["id"])
+        check("13c concluir item aguardando limpa o waiting",
+              done_now["done"] and done_now["workflow_state"] == "active"
+              and done_now["waiting_since"] is None)
+
+        # 13d. Store ilegível: leitor recebe vazio, mas nenhum mutador grava esse vazio por cima.
+        store_file = work_items._store_path()
+        good = store_file.read_text(encoding="utf-8")
+        store_file.write_text("{quebrado", encoding="utf-8")
+        try:
+            work_items.new_item("manual", "não pode gravar")
+            blocked = False
+        except OSError:
+            blocked = True
+        check("13d save recusa sobrescrever store ilegível",
+              blocked and store_file.read_text(encoding="utf-8") == "{quebrado")
+        store_file.write_text(good, encoding="utf-8")
+        check("13d sem .tmp sobrando", not list(store_file.parent.glob("work_items.*.tmp")))
+
+        # 13c. Volta sozinho: um item teams parado acorda quando a OUTRA pessoa responde depois
+        # do waiting_since. Mensagem anterior ao waiting (a que criou o item) não acorda nada,
+        # e item sem chat teams não é candidato.
+        awake = work_items.new_item("teams", "pedi revisão", external_key="teams:chat-9:msg-1")
+        manual_parked = work_items.new_item("manual", "todo parado")
+        park_ts = time.time() - 300
+        work_items.set_waiting(awake["id"], True, ts=park_ts)
+        work_items.set_waiting(manual_parked["id"], True, ts=park_ts)
+        iso = lambda offset: datetime.fromtimestamp(park_ts + offset, timezone.utc).isoformat()
+        old_only = [{"chat_id": "chat-9", "messages": [{"sender_name": "Ana", "text": "oi", "ts": iso(-30)}]}]
+        check("13c mensagem anterior ao waiting não acorda",
+              work_items.wake_on_reply(old_only) == [])
+        woken = work_items.wake_on_reply([
+            {"chat_id": "chat-9", "messages": [
+                {"sender_name": "Ana", "text": "respondi aqui", "ts": iso(60)},
+                {"sender_name": "Ana", "text": "oi", "ts": iso(-30)},
+            ]},
+        ])
+        check("13c resposta depois do waiting acorda o item",
+              [i["id"] for i in woken] == [awake["id"]])
+        awake_now = next(i for i in work_items.list_items() if i["id"] == awake["id"])
+        check("13c item acordado volta active com autoria",
+              awake_now["workflow_state"] == "active"
+              and awake_now["waiting_since"] is None
+              and awake_now["woke_by"] == "Ana")
+        check("13c item manual parado não acorda",
+              next(i for i in work_items.list_items()
+                   if i["id"] == manual_parked["id"])["workflow_state"] == "waiting")
+        check("13c acordar é idempotente (item já ativo não é candidato)",
+              work_items.wake_on_reply([
+                  {"chat_id": "chat-9", "messages": [
+                      {"sender_name": "Ana", "text": "de novo", "ts": iso(120)}]}]) == [])
+        work_items.ack_wake(awake["id"])
+        check("13c ack limpa o aviso sem mexer no estado",
+              "woke_at" not in next(i for i in work_items.list_items() if i["id"] == awake["id"]))
+
+        # 13d. Graph às vezes entrega o horário sem offset. Ler isso como hora LOCAL joga a
+        # resposta 3h pro passado (UTC-3) e o item nunca acordaria — é UTC, sempre.
+        naive = work_items.new_item("teams", "sem offset", external_key="teams:chat-tz:msg-1")
+        park_naive = time.time() - 600
+        work_items.set_waiting(naive["id"], True, ts=park_naive)
+        bare = datetime.fromtimestamp(park_naive + 120, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        woke_naive = work_items.wake_on_reply([
+            {"chat_id": "chat-tz", "messages": [{"sender_name": "Bruno", "text": "voltei", "ts": bare}]}])
+        check("13d ts sem timezone é lido como UTC",
+              [i["id"] for i in woke_naive] == [naive["id"]])
+        check("13d ts ilegível não acorda nada",
+              work_items.wake_on_reply([
+                  {"chat_id": "chat-9", "messages": [{"sender_name": "X", "text": "?", "ts": "ontem"}]}]) == [])
+        work_items.complete_item(naive["id"])
+
+        # 13e. O store inteiro é reescrito a cada save: concluir um item enquanto o wake roda
+        # não pode fazer o snapshot velho do wake ressuscitá-lo (_serialized/_MUTEX).
+        import threading as _threading
+        racer = work_items.new_item("teams", "corrida", external_key="teams:chat-race:msg-1")
+        work_items.set_waiting(racer["id"], True, ts=time.time() - 60)
+        others = [work_items.new_item("manual", f"vizinho {i}") for i in range(3)]
+        chats = [{"chat_id": "chat-race",
+                  "messages": [{"sender_name": "Dani", "text": "respondi",
+                                "ts": datetime.now(timezone.utc).isoformat()}]}]
+        barrier = _threading.Barrier(2)
+
+        def _wake():
+            barrier.wait()
+            for _ in range(20):
+                work_items.wake_on_reply(chats)
+
+        def _complete():
+            barrier.wait()
+            for it in others:
+                work_items.complete_item(it["id"])
+
+        threads = [_threading.Thread(target=_wake), _threading.Thread(target=_complete)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        final = {i["id"]: i for i in work_items.list_items()}
+        check("13e concluir durante o wake não é perdido",
+              all(final[it["id"]]["done"] for it in others))
+        check("13e o wake também sobrevive à corrida",
+              final[racer["id"]]["workflow_state"] == "active")
+        work_items.complete_item(racer["id"])
+        work_items.complete_item(awake["id"])
+        work_items.complete_item(manual_parked["id"])
 
         # 14. item concluído pode ser reaberto para a mesma origem sem duplicação.
         work_items.complete_item(waiting["id"])
@@ -239,6 +368,9 @@ def main() -> int:
         # 16. bridge expõe o lifecycle sem duplicar regra de negócio no frontend.
         check("16 bridge expõe waiting", hasattr(Bridge, "set_work_item_waiting"))
         check("16 bridge expõe reopen", hasattr(Bridge, "reopen_work_item"))
+        check("16 bridge expõe o wake (poll + ack)",
+              hasattr(Bridge, "poll_wake") and hasattr(Bridge, "ack_work_item_wake"))
+        check("16 não existe mais arquivar item", not hasattr(Bridge, "archive_work_item"))
 
         # 17. item consolidado continua no histórico, mas a Daily resolve suas ações
         # para o canônico em vez de exibir duas linhas iguais.

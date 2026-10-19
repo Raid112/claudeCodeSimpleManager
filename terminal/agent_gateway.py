@@ -582,8 +582,8 @@ class AgentGateway:
             return []
         allowed = {
             "id", "source", "external_key", "external_url", "title", "status", "duedate",
-            "duedate_has_time", "person", "sort_order", "done", "archived", "workflow_state",
-            "waiting_since", "created_at", "closed_at",
+            "duedate_has_time", "person", "sort_order", "done", "workflow_state",
+            "waiting_since", "woke_at", "woke_by", "created_at", "closed_at",
         }
         return [{key: value for key, value in item.items() if key in allowed}
                 for item in store.get("items", []) if isinstance(item, dict)]

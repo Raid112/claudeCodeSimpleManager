@@ -58,9 +58,10 @@ function wiFindExistingItem(items, candidate) {
     return null;
 }
 
+/** O que fazer ao reencontrar um item que já existe. Sem 'unarchive': item parado é sempre
+ * 'waiting' (um estado só), então retomar é a única volta que não seja reabrir um concluído. */
 function wiExistingAction(item) {
     if (item && item.done) return 'reopen';
-    if (item && item.archived) return 'unarchive';
     if (item && item.workflow_state === 'waiting') return 'resume';
     return 'link';
 }
@@ -642,8 +643,6 @@ class WorkItemsUI {
                 return false;
             }
             await this.app.reopenWorkItem(existing.id);
-        } else if (action === 'unarchive') {
-            await this.app.archiveWorkItem(existing.id, false);
         } else if (action === 'resume') {
             await this.app.setWorkItemWaiting(existing.id, false);
         }
@@ -715,7 +714,10 @@ class WorkItemsUI {
             `Fechar <span style="color:${color}">${this._esc(keyLabel)}</span> · ${this._esc(this.app.getDisplayName(ptySessionId))}`;
 
         const acts = document.getElementById('wi-close-acts');
-        let html = `<div class="act-row main" data-act="complete"><svg viewBox="0 0 20 20"><use href="#i-check"/></svg>Concluir work item<span class="tag">marca done</span></div>`;
+        // Teams: "respondi, agora é com a pessoa" é o desfecho mais comum de uma mensagem —
+        // por isso Aguardar é a linha em destaque ali, e Concluir nos outros casos.
+        const waitIsMain = wi.source === 'teams';
+        let html = `<div class="act-row ${waitIsMain ? '' : 'main'}" data-act="complete"><svg viewBox="0 0 20 20"><use href="#i-check"/></svg>Concluir work item<span class="tag">fecha todas as abas</span></div>`;
         if (wi.source === 'jira' && wi.external_key) {
             html += `<div class="act-row" data-act="transition"><svg viewBox="0 0 20 20"><use href="#i-issue"/></svg>Transicionar issue<span class="tag" id="wi-trans-tag">${this._esc(wi.status || '')} →</span></div>`;
             html += `<div class="act-row" data-act="browser"><svg viewBox="0 0 20 20"><use href="#i-msg"/></svg>Abrir no Jira<span class="tag">comentar</span></div>`;
@@ -723,8 +725,10 @@ class WorkItemsUI {
         if (wi.source === 'teams') {
             html += `<div class="act-row" data-act="notify"><svg viewBox="0 0 20 20"><use href="#i-msg"/></svg>Copiar aviso de conclusão<span class="tag">avisar a pessoa</span></div>`;
         }
-        html += `<div class="act-row wait" data-act="wait"><svg viewBox="0 0 20 20"><use href="#i-wait"/></svg>Aguardar resposta<span class="tag">esconde abas · mantém cache</span></div>`;
-        html += `<div class="act-row" data-act="archive"><svg viewBox="0 0 20 20"><use href="#i-arch"/></svg>Só arquivar a aba<span class="tag">item segue aberto</span></div>`;
+        const waitTag = wi.source === 'teams'
+            ? 'volta quando responderem' : 'retome pela seta quando voltar';
+        html += `<div class="act-row wait ${waitIsMain ? 'main' : ''}" data-act="wait"><svg viewBox="0 0 20 20"><use href="#i-wait"/></svg>Aguardar resposta<span class="tag">${waitTag}</span></div>`;
+        html += `<div class="act-row" data-act="close"><svg viewBox="0 0 20 20"><use href="#i-arch"/></svg>Fechar só esta aba<span class="tag">task segue ativa</span></div>`;
         acts.innerHTML = html;
 
         acts.querySelectorAll('.act-row').forEach(el =>
@@ -742,8 +746,7 @@ class WorkItemsUI {
             await this.app.closeTerminal(ptySessionId);
         } else if (act === 'wait') {
             await this.app.setWorkItemWaiting(wi.id, true);
-        } else if (act === 'archive') {
-            if (sessionKey) await this.app.archiveSession(sessionKey, true);
+        } else if (act === 'close') {
             await this.app.closeTerminal(ptySessionId);
         } else if (act === 'browser') {
             if (wi.external_url) window.pywebview.api.open_url(wi.external_url);

@@ -184,8 +184,10 @@ assert.equal(wiFindExistingItem(existingItems, {
     title: 'Cópia consolidada', person: 'Carol',
 }), null);
 assert.equal(wiExistingAction({ done: true }), 'reopen');
-assert.equal(wiExistingAction({ archived: true }), 'unarchive');
 assert.equal(wiExistingAction({ workflow_state: 'waiting' }), 'resume');
+// `archived` de item não existe mais: a migração (work_items._migrate_item_archived) já o
+// converteu em waiting, então um item com o campo velho não tem tratamento próprio aqui.
+assert.equal(wiExistingAction({ archived: true }), 'link');
 assert.equal(wiExistingAction({}), 'link');
 assert.equal(wiWaitingElapsed((NOW - 30 * 60e3) / 1000, NOW), '30m');
 assert.equal(wiWaitingElapsed((NOW - 3 * 3600e3) / 1000, NOW), '3h');
@@ -194,11 +196,10 @@ assert.deepEqual(
     Object.fromEntries(Object.entries(wiPartitionWorkItems([
         { id: 'a' },
         { id: 'w', workflow_state: 'waiting' },
-        { id: 'x', archived: true },
         { id: 'd', done: true },
         { id: 'm', merged_into: 'a' },
     ])).map(([k, v]) => [k, v.map(x => x.id)])),
-    { active: ['a'], waiting: ['w'], archived: ['x'] },
+    { active: ['a'], waiting: ['w'] },
 );
 
 // ---------- integração leve: _rows() no segmento Mensagens ----------

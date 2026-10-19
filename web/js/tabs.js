@@ -52,7 +52,8 @@ class TabBar {
         // Trava sem efeito quando o item sumiu (concluído/arquivado/apagado) OU não tem
         // nenhuma aba viva — travar um item recém-criado pelo ＋ colapsaria a barra inteira
         // pra mostrar uma gaveta vazia.
-        const lockAlive = lockedId && wiItems.some(it => it.id === lockedId && !it.done && !it.archived);
+        const lockAlive = lockedId && wiItems.some(
+            it => it.id === lockedId && !it.done && it.workflow_state !== 'waiting');
         const lockHasTabs = lockAlive && Object.keys(this.app.terminals).some(id => {
             const w = this.app.workItemForSession ? this.app.workItemForSession(id) : null;
             return w && w.id === lockedId;
@@ -60,12 +61,17 @@ class TabBar {
         const locked = lockHasTabs ? lockedId : null;
 
         const links = this.app.workItems ? (this.app.workItems.session_links || {}) : {};
+        const parkedIds = new Set(wiItems.filter(it => !it.done && !it.merged_into && it.workflow_state === 'waiting').map(it => it.id));
         for (const [id, info] of Object.entries(this.app.terminals)) {
-            // Aba arquivada (individual ou via item arquivado que cascateou) some da barra.
+            // Fora da barra: aba escondida individualmente, ou aba de um item "aguardando"
+            // (parar de esperar traz todas de volta). Nada é fechado — só some da barra.
             const linkKey = this.app.sessionLinkKeyOf ? this.app.sessionLinkKeyOf(id) : info.claudeSessionId;
-            const link = (linkKey && links[linkKey]) || (info.claudeSessionId ? links[info.claudeSessionId] : null);
-            if (link && link.archived) continue;
+            const link = this.app.linkOf ? this.app.linkOf(id)
+                : ((linkKey && links[linkKey]) || (info.claudeSessionId ? links[info.claudeSessionId] : null));
             const isActive = this.app.activeTerminalId === id;
+            // Aba de task "aguardando" mora na sidebar. A ativa nunca some: se está na tela,
+            // tem que ter rótulo na barra.
+            if (!isActive && link && link.wi_id && parkedIds.has(link.wi_id)) continue;
             const dotClass = info.instance.status;  // 'running', 'ready', or 'stopped'
             const displayName = this.app.getDisplayName(id);
             const timerHtml = this._renderTimer(info.instance);

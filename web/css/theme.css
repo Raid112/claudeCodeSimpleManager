@@ -977,7 +977,12 @@ body.col-resizing {
   transition:opacity var(--ease),color var(--ease)}
 .wi:hover .wi-arch{opacity:.5}
 .wi-arch:hover{opacity:1;color:#fff}
-.wi-arch.on{opacity:.7}  /* na seção Arquivado: sempre visível (é o botão desarquivar) */
+/* "voltou porque responderam": o único badge sempre visível no card, senão o item
+   reaparece na fila sem explicar por quê. Some no primeiro clique (ack). */
+.wi-woke{font-size:9px;font-weight:700;letter-spacing:.4px;color:#9be8b8;
+  border:1px solid rgba(74,222,128,.32);background:rgba(74,222,128,.1);
+  border-radius:var(--tr-sm);padding:1px 5px;white-space:nowrap;max-width:110px;
+  overflow:hidden;text-overflow:ellipsis}
 .wi-wait{width:14px;height:14px;flex:none;opacity:0;color:var(--text-dim);cursor:pointer;
   transition:opacity var(--ease),color var(--ease)}
 .wi:hover .wi-wait{opacity:.55}
@@ -1004,8 +1009,8 @@ body.col-resizing {
   border-radius:50%;padding:2px;background:rgba(192,132,252,.1);
   transition:opacity var(--ease),background-color var(--ease),box-shadow var(--ease)}
 .wi-resume:hover{opacity:1;background:rgba(192,132,252,.2);box-shadow:0 0 8px rgba(192,132,252,.28)}
-.wi-waiting .wi-arch{opacity:.22}
-.wi-waiting:hover .wi-arch{opacity:.5}
+.wi-waiting .wi-done{opacity:.22}
+.wi-waiting:hover .wi-done{opacity:.6}
 
 /* deadline pills */
 .due{margin-left:auto;font-size:10px;white-space:nowrap;font-weight:600}

@@ -16,6 +16,9 @@ from terminal.ws_server import WebSocketServer
 from terminal import work_items, jira_client, teams_graph
 from terminal import agent_decisions
 from terminal import ui_log
+# How often poll_wake may actually hit Graph. Matches teams_graph's own cache TTL: a
+# shorter interval would only re-read the same cached chats.
+WAKE_POLL_SECONDS = 120
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 SESSIONS_PATH = Path(__file__).parent.parent / "sessions.json"
@@ -71,6 +74,7 @@ class Bridge:
         self._operator_capabilities: dict[str, dict] = {}
         self._emergency_capability = secrets.token_urlsafe(32)
         self._hermes_publisher = None  # set by main.py; see set_hermes_publisher
+        self._last_wake_poll = 0.0     # see poll_wake
 
     def set_window(self, window: webview.Window):
         self._window = window
@@ -135,22 +139,50 @@ class Bridge:
             print(f"open_logs_dir failed: {exc}")
             return ""
 
+    def notify_wake(self, person: str, title: str):
+        """Toast for a parked item that came back on its own because the other side
+        answered (see main.py's wake poll). Best-effort, exactly like notify_state."""
+        try:
+            from windows_toasts import WindowsToaster, Toast
+
+            if self._toaster is None:
+                self._toaster = WindowsToaster("Claude Manager")
+
+            toast = Toast()
+            toast.text_fields = [f"{person or 'Alguém'} respondeu", title or ""]
+            toast.on_activated = lambda _args=None: self._focus_window()
+            self._toaster.show_toast(toast)
+        except Exception as e:
+            print(f"notify_wake failed (toast skipped): {e}")
+
     def _focus_tab(self, session_id: str):
         """Bring the window to the foreground and select the given tab.
 
         Runs on the windows_toasts activation thread. The on_top toggle is the
         standard pywebview trick to force the window to the foreground on Windows.
         """
+        if not self._focus_window():
+            return
+        try:
+            self._window.evaluate_js(
+                f"window.app && window.app.switchToTerminal({json.dumps(session_id)})")
+        except Exception as e:
+            print(f"_focus_tab failed: {e}")
+
+    def _focus_window(self) -> bool:
+        """Bring the window forward (the on_top toggle is the pywebview trick for it).
+        False when there is no window or the call failed."""
         win = self._window
         if win is None:
-            return
+            return False
         try:
             win.restore()
             win.on_top = True
             win.on_top = False
-            win.evaluate_js(f"window.app && window.app.switchToTerminal({json.dumps(session_id)})")
+            return True
         except Exception as e:
-            print(f"_focus_tab failed: {e}")
+            print(f"_focus_window failed: {e}")
+            return False
 
     def get_groups(self) -> list[dict]:
         config = _load_config()
@@ -414,9 +446,40 @@ class Bridge:
     def set_work_item_waiting(self, wi_id: str, waiting: bool = True) -> dict | None:
         return work_items.set_waiting(wi_id, waiting)
 
-    def archive_work_item(self, wi_id: str, archived: bool = True):
-        """Archive/unarchive a whole item; cascades to its sessions (see set_item_archived)."""
-        work_items.set_item_archived(wi_id, archived)
+    def poll_wake(self) -> list:
+        """Unpark items whose Teams chat got a reply (terminal/work_items.wake_on_reply).
+
+        Driven by the frontend's own refresh tick rather than a background timer, on purpose:
+        the store is rewritten whole on every save, so a timer thread writing it unattended
+        every couple of minutes can bury a change the user just made. Coming in through the
+        bridge puts this on the same path as every other mutation.
+
+        Throttled to WAKE_POLL_SECONDS, and Graph is skipped entirely when nothing teams-ish
+        is parked — an idle queue costs one list comprehension. Never raises.
+        Returns the items that came back so the caller can refresh."""
+        now = time.time()
+        if now - self._last_wake_poll < WAKE_POLL_SECONDS:
+            return []
+        self._last_wake_poll = now
+        try:
+            parked = [it for it in work_items.list_items()
+                      if not it.get("done")
+                      and it.get("workflow_state") == "waiting"
+                      and work_items.teams_chat_id(it)]
+            if not parked:
+                return []
+            woken = work_items.wake_on_reply(teams_graph.list_recent())
+        except Exception as exc:
+            print(f"[wake] poll failed: {exc}")
+            return []
+        for item in woken:
+            self.notify_wake(item.get("woke_by"), item.get("title"))
+        return [{"wi_id": it["id"], "person": it.get("woke_by"), "title": it.get("title")}
+                for it in woken]
+
+    def ack_work_item_wake(self, wi_id: str):
+        """Dismiss the "they answered" badge after the user opened the item."""
+        work_items.ack_wake(wi_id)
 
     def reorder_work_items(self, ordered_ids: list):
         work_items.reorder(ordered_ids)
@@ -427,9 +490,6 @@ class Bridge:
 
     def unlink_session(self, session_key: str):
         work_items.unlink(session_key)
-
-    def archive_session(self, session_key: str, archived: bool = True):
-        work_items.set_archived(session_key, archived)
 
     def work_daily_digest(self, days: int = 2) -> dict:
         """Operational recap: today/yesterday plus active waiting items."""

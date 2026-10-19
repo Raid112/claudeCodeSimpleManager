@@ -242,6 +242,11 @@ def main():
 
     window.events.closing += on_closing
 
+    # Parked ("aguardando") items come back on their own when the person answers — that poll
+    # lives in Bridge.poll_wake, called from the frontend's refresh tick (see web/js/app.js),
+    # not in a thread here: a background timer rewriting work_items.json unattended can bury
+    # a change the user just made.
+
     # DevTools only when asked for (CLAUDEMANAGER_DEBUG=1). It used to open with every
     # window, which is a request inspector nobody asked for on every launch; the UI log
     # in %LOCALAPPDATA%\ClaudeManager\logs covers the diagnostics it was there for.

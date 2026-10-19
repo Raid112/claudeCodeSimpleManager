@@ -246,7 +246,10 @@ class App {
 
         // Work Items can also be created/changed through the Hermes gateway, outside this
         // webview. Keep the sidebar/tab projection fresh without requiring a restart.
-        setInterval(() => this.refreshWorkItems(), 5000);
+        setInterval(async () => {
+            await this._pollWake();
+            await this.refreshWorkItems();
+        }, 5000);
     }
 
     async openTerminal(groupName, path, continueSession = false, claudeSessionId = null, terminalType = null, agentSessionId = null, sessionKey = null) {
@@ -341,14 +344,13 @@ class App {
 
         delete this.terminals[sessionId];
 
-        // Switch to another tab or show welcome
-        const remaining = Object.keys(this.terminals);
+        // Switch to another tab or show welcome. Só abas visíveis na barra: cair numa aba
+        // escondida/aguardando deixava o terminal na tela sem aba correspondente.
+        const remaining = Object.keys(this.terminals).filter(id => !this.isTabHidden(id));
         if (remaining.length > 0) {
             this.switchToTerminal(remaining[remaining.length - 1]);
         } else {
-            this.activeTerminalId = null;
-            this._updateWelcome();
-            this.tabBar.render();
+            this._clearActive();
         }
 
         await this.sidebar.render();
@@ -478,9 +480,12 @@ class App {
             // Switch to previously active tab
             const terminalIds = Object.keys(this.terminals);
             const activeIdx = saved.active_tab_index || 0;
-            if (terminalIds.length > 0 && activeIdx < terminalIds.length) {
-                this.switchToTerminal(terminalIds[activeIdx]);
-            }
+            // Aba de task aguardando não abre como ativa: mora na sidebar.
+            const visible = terminalIds.filter(id => !this.isTabHidden(id));
+            const want = terminalIds[activeIdx];
+            const pick = want && !this.isTabHidden(want) ? want : visible[0];
+            if (pick) this.switchToTerminal(pick);
+            else if (terminalIds.length) this._clearActive();
         } catch (e) {
             console.error('Session restore failed:', e);
             this._restoring = false;
@@ -573,15 +578,53 @@ class App {
         return this.activeTerminalId ? this.claudeSessionIdOf(this.activeTerminalId) : null;
     }
 
+    /** session_links entry for a pty session: current key, then claudeSessionId, then the
+     * tab's sessionKey (a claude tab linked before its session id existed). */
+    linkOf(sessionId) {
+        const info = this.terminals[sessionId];
+        if (!info) return null;
+        const links = (this.workItems && this.workItems.session_links) || {};
+        for (const k of [this.sessionLinkKeyOf(sessionId), info.claudeSessionId, info.sessionKey]) {
+            if (k && links[k]) return links[k];
+        }
+        return null;
+    }
+
+    /** Aba não tem estado próprio, segue a task: ativa → barra do topo, aguardando → sidebar,
+     * concluída → fechada. Fora da barra = só aba de task "aguardando". */
+    isTabHidden(sessionId) {
+        const link = this.linkOf(sessionId);
+        if (!link) return false;
+        return !!link.wi_id && (this.workItems.items || []).some(
+            it => it.id === link.wi_id && !it.done && !it.merged_into && it.workflow_state === 'waiting');
+    }
+
+    /** Trava apontando pra item que saiu da lista ativa (concluído/aguardando) é limpa —
+     * senão ela re-engata sozinha quando o item volta. */
+    async _dropStaleLock(wiId) {
+        if (this.lockedWiId !== wiId) return;
+        this.lockedWiId = null;
+        try { await window.pywebview.api.set_layout({ locked_wi_id: null }); } catch (e) {}
+    }
+
     /** The work item a pty session is linked to (via session_links), or null. */
     workItemForSession(sessionId) {
-        const info = this.terminals[sessionId];
-        const csid = info ? (info.claudeSessionId || null) : null;
-        const key = this.sessionLinkKeyOf(sessionId);
-        if (!key) return null;
-        const link = this.workItems.session_links[key] || (csid && this.workItems.session_links[csid]);
-        if (!link || link.archived || !link.wi_id) return null;
-        return this.workItems.items.find(it => it.id === link.wi_id) || null;
+        if (!this.sessionLinkKeyOf(sessionId)) return null;
+        const link = this.linkOf(sessionId);
+        if (!link || !link.wi_id) return null;
+        // Mesmo critério da sidebar (wiPartitionWorkItems): item concluído/mesclado não
+        // "segura" a aba. Antes a barra seguia pintando a aba com o TODO concluído enquanto
+        // a sidebar a listava em Avulso, e fechar a aba reabria o diálogo com "Concluir".
+        const it = this.workItems.items.find(x => x.id === link.wi_id);
+        return it && !it.done && !it.merged_into ? it : null;
+    }
+
+    /** Pergunta ao backend se alguém respondeu num item parado (ele mesmo se limita a uma
+     * ida ao Graph a cada 2 min). Fica no tick do frontend de propósito: a escrita no store
+     * passa pelo mesmo caminho das ações do usuário, em vez de uma thread mexendo no arquivo
+     * sozinha. O re-render sai do refreshWorkItems logo em seguida. */
+    async _pollWake() {
+        try { await window.pywebview.api.poll_wake(); } catch (e) { /* offline/Graph fora */ }
     }
 
     /** Refetch the work-items snapshot and re-render the sidebar/tabs. Call after mutations. */
@@ -641,9 +684,21 @@ class App {
         await this.refreshWorkItems();
     }
 
+    /** pty ids das abas vivas vinculadas a uma task. */
+    tabsOfItem(wiId) {
+        return Object.keys(this.terminals).filter(id => {
+            const link = this.linkOf(id);
+            return link && link.wi_id === wiId;
+        });
+    }
+
+    /** Concluir = fim: a task sai e todas as abas dela fecham junto. */
     async completeWorkItem(wiId) {
+        await this._dropStaleLock(wiId);
+        const tabs = this.tabsOfItem(wiId);
         await window.pywebview.api.complete_work_item(wiId);
         await this.refreshWorkItems();
+        for (const id of tabs) await this.closeTerminal(id);
     }
 
     async reopenWorkItem(wiId) {
@@ -651,47 +706,31 @@ class App {
         await this.refreshWorkItems();
     }
 
+    /** Park/unpark an item. Parked = "respondi, não tenho ação até voltarem": its tabs stay
+     * alive but leave the tab bar, and a Teams item comes back on its own when the person
+     * replies (main.py's wake poll). This is the ONLY way to park — there is no separate
+     * "arquivar item". */
     async setWorkItemWaiting(wiId, waiting = true) {
-        const matching = Object.entries(this.terminals)
-            .filter(([ptyId, info]) => {
-                const key = this.sessionLinkKeyOf(ptyId);
-                const legacy = info.claudeSessionId || null;
-                const link = (key && this.workItems.session_links[key])
-                    || (legacy && this.workItems.session_links[legacy]);
-                return link && link.wi_id === wiId;
-            })
-            .map(([ptyId]) => ptyId);
+        const matching = this.tabsOfItem(wiId);
 
+        if (waiting) await this._dropStaleLock(wiId);
         if (waiting && matching.includes(this.activeTerminalId)) {
-            const next = Object.keys(this.terminals).find(id => !matching.includes(id));
+            const next = Object.keys(this.terminals)
+                .find(id => !matching.includes(id) && !this.isTabHidden(id));
             if (next) this.switchToTerminal(next);
+            else this._clearActive();   // nenhuma aba sobra na barra: tela de boas-vindas
         }
         await window.pywebview.api.set_work_item_waiting(wiId, waiting);
         await this.refreshWorkItems();
         if (!waiting && matching.length) this.switchToTerminal(matching[0]);
     }
 
-    async archiveSession(sessionKey, archived = true) {
-        await window.pywebview.api.archive_session(sessionKey, archived);
-        await this.refreshWorkItems();
-    }
-
-    /** Archive/unarchive a whole work item. Its tabs cascade-hide (backend flags their links),
-     * so if the active tab belongs to it, jump focus to a still-visible tab first. */
-    async archiveWorkItem(wiId, archived = true) {
-        if (archived && this.activeTerminalId) {
-            const hidden = new Set();
-            for (const [ptyId, info] of Object.entries(this.terminals)) {
-                const key = this.sessionLinkKeyOf(ptyId);
-                const link = key ? this.workItems.session_links[key] : null;
-                if (link && link.wi_id === wiId) hidden.add(ptyId);
-            }
-            if (hidden.has(this.activeTerminalId)) {
-                const next = Object.keys(this.terminals).find(id => !hidden.has(id));
-                if (next) this.switchToTerminal(next);
-            }
-        }
-        await window.pywebview.api.archive_work_item(wiId, archived);
+    /** Dismiss the "↩ fulano respondeu" badge on an item that unparked itself. No state
+     * change (the item is already active) — just marks the notice as seen. */
+    async ackWorkItemWake(wiId) {
+        const it = (this.workItems.items || []).find(x => x.id === wiId);
+        if (!it || !it.woke_at) return;
+        try { await window.pywebview.api.ack_work_item_wake(wiId); } catch (e) { return; }
         await this.refreshWorkItems();
     }
 
@@ -737,8 +776,18 @@ class App {
     }
 
     _updateWelcome() {
-        const hasTerminals = Object.keys(this.terminals).length > 0;
-        this.welcomeEl.style.display = hasTerminals ? 'none' : 'flex';
+        // Abas vivas mas todas aguardando (na sidebar) = nada ativo na tela.
+        const showing = !!this.activeTerminalId && !!this.terminals[this.activeTerminalId];
+        this.welcomeEl.style.display = showing ? 'none' : 'flex';
+    }
+
+    /** Nenhuma aba ativa (as que restam estão aguardando na sidebar). */
+    _clearActive() {
+        this.activeTerminalId = null;
+        for (const info of Object.values(this.terminals)) info.container.classList.remove('active');
+        this._updateWelcome();
+        this.tabBar.render();
+        if (this.composer) this.composer.refreshTarget();
     }
 }
 
