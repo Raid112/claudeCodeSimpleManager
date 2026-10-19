@@ -931,6 +931,9 @@ body.col-resizing {
   transition:color var(--ease),border-color var(--ease),background-color var(--ease)}
 .titlebar-daily:hover{color:#fff;border-color:var(--border);background:var(--bg-hover)}
 
+/* reload sessions button in the titlebar */
+#reload-sessions-btn{margin-left:8px}
+
 /* section headers */
 .sec-head{display:flex;align-items:center;gap:6px;padding:10px 12px 5px;color:var(--text-head);
   font-size:10px;font-weight:700;letter-spacing:1.3px;text-transform:uppercase;cursor:pointer;user-select:none}

@@ -96,6 +96,7 @@ class App {
         this.activeTerminalId = null;
         this.wsPort = null;
         this._isRenaming = false;
+        this._adoptingExternal = new Set();
 
         // Work-items snapshot ({version, items, session_links}), refreshed after local
         // mutations and periodically so external actors (Hermes/gateway) appear without
@@ -130,6 +131,10 @@ class App {
         // Work-items overlays (link popover, close ceremony, daily digest)
         this.workItemsUI = new WorkItemsUI(this);
         this.agentApprovals = new AgentApprovals(this, document.getElementById('agent-approvals'));
+        const reloadSessionsBtn = document.getElementById('reload-sessions-btn');
+        if (reloadSessionsBtn) {
+            reloadSessionsBtn.addEventListener('click', () => this.refreshStatus());
+        }
         const dailyBtn = document.getElementById('daily-btn');
         if (dailyBtn) dailyBtn.addEventListener('click', () => this.workItemsUI.openDaily());
         // Sem DevTools aberto por padrão, a pasta de logs é a única porta de entrada do
@@ -364,6 +369,42 @@ class App {
         }
     }
 
+    async _adoptExternalSession(serverData) {
+        const sessionId = serverData.id;
+        if (!sessionId || this.terminals[sessionId] || this._adoptingExternal.has(sessionId)) return false;
+
+        this._adoptingExternal.add(sessionId);
+        try {
+            const capability = await window.pywebview.api.issue_ws_capability(sessionId);
+            if (!capability) return false;
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'terminal-wrapper';
+            wrapper.id = `term-${sessionId}`;
+            this.terminalContainerEl.appendChild(wrapper);
+
+            const instance = new TerminalInstance(sessionId, this.wsPort, wrapper, capability);
+            instance.backendState = serverData.state || null;
+            instance.backendStateTs = serverData.state_ts ? serverData.state_ts * 1000 : null;
+            this.terminals[sessionId] = {
+                instance,
+                groupName: serverData.group_name,
+                path: serverData.path,
+                container: wrapper,
+                claudeSessionId: serverData.claude_session_id || null,
+                agentSessionId: serverData.agent_session_id || serverData.claude_session_id || null,
+                sessionKey: serverData.session_key || null,
+                terminalType: serverData.terminal_type || 'claude',
+                customName: null,
+            };
+
+            this.switchToTerminal(sessionId);
+            return true;
+        } finally {
+            this._adoptingExternal.delete(sessionId);
+        }
+    }
+
     async refreshStatus() {
         // Update alive status from backend
         const serverTerminals = await window.pywebview.api.get_terminals();
@@ -371,6 +412,14 @@ class App {
         let sessionMetadataChanged = false;
         for (const t of serverTerminals) {
             serverMap[t.id] = t;
+        }
+
+        // Sessions opened through the Hermes gateway already have a PTY. Attach the
+        // frontend to that PTY instead of opening a second one. This also makes the
+        // manual reload button useful when the first poll raced the gateway dispatch.
+        const externalSessions = findExternalSessions(serverTerminals, Object.keys(this.terminals));
+        for (const session of externalSessions) {
+            await this._adoptExternalSession(session);
         }
 
         for (const [id, info] of Object.entries(this.terminals)) {
