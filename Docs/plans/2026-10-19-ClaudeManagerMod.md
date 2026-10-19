@@ -97,7 +97,7 @@ Cada hook faz `await next(e)` primeiro (não altera o comportamento) e depois `P
 | `turn.start` sem `agentId` | `UserPromptSubmit` | Também cobre turno iniciado por `$.prompt.submit` (que o `prompt.submit` do próprio plugin não vê, por causa da regra de re-entrada) |
 | `tool.call` antes do `next` | `PreToolUse` (+ `tool_use_id`, `agentId`) | |
 | `tool.call` depois do `next` | `PostToolUse` | `isError` / `deny` vão junto |
-| `tool.check` com veredito `ask` | `PermissionAsk` (novo) | No modo `default`, `ask` = o diálogo abre assim que o hook devolve (S4). No modo `auto`, o `ask` vai pro classificador: não testado (ver S4b) |
+| `tool.check` com veredito `ask`, a tool **ainda parada 3s depois** | `PermissionAsk` (novo) | O `tool.check` roda antes do modo decidir o `ask`: no `auto`/`acceptEdits` o classificador ou o modo muitas vezes libera sem diálogo. A API não expõe o modo efetivo, então o mod arma um timer de 3s por `tool_use_id` e cancela quando o `tool.call` resolve. Diálogo real é reportado até 3s atrasado; liberação rápida do modo nunca acende `tooluse` (nem bloqueia composer, toca som ou acorda o Hermes) |
 | `turn.complete` sem `agentId`, `reason: answer` | `Stop` | |
 | `turn.complete`, `reason: aborted` | `Stop` + `aborted: true` | Esc do usuário |
 | `turn.complete`, `reason: error \| refusal` | `StopFailure` (novo) | Hoje a aba fica presa em `running` |
@@ -201,7 +201,7 @@ Spike reproduzível em `Docs/plans/2026-10-19-ClaudeManagerMod-spike/` (mod `cm-
 
 ## 9. Ordem, gates e rollback
 
-**Estado em 2026-10-19:** Fases 1 e 2 implementadas na branch `feat/claude-mod`, com 7 testes do mod, 45 checks em `tests/mod_bridge_check.py` e um e2e com `claude` real (hello, running → ready, uso, troca de id no `/clear`, restart retomando). Flag `claude_mod.enabled` ainda desligada.
+**Estado em 2026-10-19:** Fases 1 e 2 implementadas na branch `feat/claude-mod`, com 8 testes do mod, 45 checks em `tests/mod_bridge_check.py` e um e2e com `claude` real (`Docs/plans/2026-10-19-ClaudeManagerMod-spike/e2e_mod.py`: hello, running → ready, uso, troca de id no `/clear`, restart retomando). Flag `claude_mod.enabled` ainda desligada. **Gate pra ligar:** o S4b manual no modo `auto` (uma aba, um Bash que o classificador avalia; o estado não pode piscar `tooluse` nem o publisher do Hermes publicar `permission_requested`).
 
 1. Fase 0 (spikes): feita, gate passou (S1 via `--plugin-dir`, S2 ok, S3 via eventos nativos). Falta o S4b manual.
 2. Fase 1 + Fase 2 juntas (o transporte sem consumidor não se prova) → liga `claude_mod.enabled` só numa aba de teste. Critério: uma semana sem aba presa em estado errado; o Hermes recebe o mesmo número de `task_completed` que antes.
