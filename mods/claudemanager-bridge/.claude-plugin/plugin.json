@@ -1,0 +1,5 @@
+{
+  "name": "claudemanager-bridge",
+  "version": "0.1.0",
+  "description": "Reports a ClaudeManager tab's state (turns, tools, permission asks, usage) to the manager over loopback. Inert outside a managed tab."
+}

@@ -27,3 +27,6 @@ sessions.json
 
 # Secrets (Jira token, Graph ids). Lives in %LOCALAPPDATA%; ignored here as belt-and-suspenders.
 secrets.json
+
+# Written by Claude Code each time it loads a mod (this build's API + the user's MCP tools)
+mods/*/.claude-plugin/types/
