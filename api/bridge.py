@@ -16,6 +16,7 @@ from terminal.ws_server import WebSocketServer
 from terminal import work_items, jira_client, teams_graph
 from terminal import agent_decisions
 from terminal import agent_contracts
+from terminal import hermes_events
 from terminal import ui_log
 from terminal.agent_contracts import ACTION_SEND_PROMPT, EXECUTION_SENT, EXECUTION_UNKNOWN
 from terminal.input_protocol import InputProtocolError
@@ -853,6 +854,99 @@ class Bridge:
     def work_daily_digest(self, days: int = 2) -> dict:
         """Operational recap: today/yesterday plus active waiting items."""
         return work_items.work_overview(days)
+
+    def work_item_agent_state(self, days_back: int = 7) -> dict:
+        """Read-only feed for the Work Item overview panel (Task 6): per work
+        item id, whether a Hermes prompt approval is pending (and which
+        pending_reason(s)) plus the most recent task_completed /
+        permission_requested / process_exited outcome for its linked
+        session(s). Returns ``{wi_id: {"pending_reasons": [...], "events":
+        {event_type: {"ts", "status", "tool_name"}}}}``, omitting any work
+        item with neither.
+
+        Deliberately does NOT call list_pending_agent_decisions(): that method
+        issues/rotates one-time operator capabilities as a side effect
+        (_issue_operator_capability), and this panel polls independently of
+        agent-approvals.js's own poll -- calling it here would silently
+        invalidate a capability an approval card is currently holding. Instead
+        this reads the same raw layers and joins with
+        work_items.resolve_work_item_id (the same join hermes_events'
+        publisher and agent_gateway's GET /v1/events already use).
+
+        Never raises: this panel must never show an error state just because
+        Hermes or the approval subsystem is not running or nothing is linked.
+        """
+        try:
+            store = work_items.load_store()
+        except Exception:
+            store = {"items": [], "session_links": {}}
+        find_session = getattr(self.pty_manager, "find_by_session_key", lambda _key: None)
+
+        pending_by_wi: dict[str, set] = {}
+        try:
+            session_links = store.get("session_links") or {}
+            for state in agent_decisions.list_pending_decisions():
+                target = ((state.get("proposal") or {}).get("action") or {}).get("target") or {}
+                session_key = target.get("session_key")
+                csid = None
+                if session_key:
+                    try:
+                        session = find_session(session_key)
+                    except Exception:
+                        session = None
+                    csid = getattr(session, "claude_session_id", None) if session else None
+                wi_id = work_items.resolve_work_item_id(session_links, session_key, csid)
+                if wi_id:
+                    pending_by_wi.setdefault(wi_id, set()).add(state.get("pending_reason"))
+        except Exception:
+            pending_by_wi = {}
+
+        events_by_wi: dict[str, dict] = {}
+        try:
+            session_links = store.get("session_links") or {}
+            since = time.time() - days_back * 86400
+            # Widen the read for disambiguation context only, mirroring
+            # agent_gateway._handle_events: a Notification landing right at the
+            # window edge needs its preceding same-session raw event to tell
+            # permission_requested apart from a logged-only status change.
+            lookback = max(0.0, since - hermes_events.OVERLAP_WINDOW_S)
+            prev_event_by_session: dict[str, str] = {}
+            for rec in work_items.read_events(since=lookback):
+                session_key = rec.get("session_key")
+                prev_event = prev_event_by_session.get(session_key) if session_key else None
+                try:
+                    normalized = hermes_events.normalize_event(rec, prev_event)
+                except Exception:
+                    normalized = None
+                if session_key:
+                    prev_event_by_session[session_key] = rec.get("event")
+                if normalized is None:
+                    continue
+                wi_id = work_items.resolve_work_item_id(
+                    session_links, session_key, rec.get("claude_session_id"))
+                if not wi_id:
+                    continue
+                ts = rec.get("ts") or 0
+                slot = events_by_wi.setdefault(wi_id, {})
+                event_type = normalized["event_type"]
+                prior = slot.get(event_type)
+                if prior is None or ts > prior["ts"]:
+                    slot[event_type] = {
+                        "ts": ts,
+                        "status": normalized.get("status") or "",
+                        "tool_name": normalized.get("tool_name") or "",
+                    }
+        except Exception:
+            events_by_wi = {}
+
+        wi_ids = set(pending_by_wi) | set(events_by_wi)
+        return {
+            wi_id: {
+                "pending_reasons": sorted(r for r in pending_by_wi.get(wi_id, ()) if r),
+                "events": events_by_wi.get(wi_id, {}),
+            }
+            for wi_id in wi_ids
+        }
 
     # ---------- Jira (on-demand, read + transition; token in secrets.json) ----------
     # Every method degrades to a benign empty/false when Jira is disabled — the UI

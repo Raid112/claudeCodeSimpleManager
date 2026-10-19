@@ -109,6 +109,55 @@ function wiSince(tsSeconds, now = Date.now()) {
     return `${days} ${days === 1 ? 'dia' : 'dias'}`;
 }
 
+const WI_AGENT_EVENT_LABEL = { task_completed: 'concluída', permission_requested: 'permissão', process_exited: 'encerrado' };
+const WI_AGENT_EVENT_ORDER = ['task_completed', 'permission_requested', 'process_exited'];
+const WI_PENDING_LABEL = { awaiting_approval: 'aprovação pendente', awaiting_dispatch: 'aguardando envio' };
+
+/** Uma linha compacta com os eventos Hermes mais recentes de um work item (no
+ * máximo os 3 tipos publicáveis: task_completed/permission_requested/
+ * process_exited), mais recente primeiro. '' se `events` não tem nada. */
+function wiAgentEventsLine(events, now = Date.now()) {
+    if (!events) return '';
+    return WI_AGENT_EVENT_ORDER
+        .map(k => (events[k] ? { k, ...events[k] } : null))
+        .filter(Boolean)
+        .sort((a, b) => b.ts - a.ts)
+        .map(e => `${WI_AGENT_EVENT_LABEL[e.k] || e.k} ${wiSince(e.ts, now)}`)
+        .join(' · ');
+}
+
+/** Rótulo do(s) motivo(s) de aprovação pendente, ou '' se nada pendente. */
+function wiPendingLabel(reasons) {
+    if (!reasons || !reasons.length) return '';
+    return [...new Set(reasons)].map(r => WI_PENDING_LABEL[r] || r).join(', ');
+}
+
+/** Linha combinada (pendência + eventos recentes) para um work item, a partir
+ * da entrada `{pending_reasons, events}` que `work_item_agent_state` devolve
+ * por wi_id. '' quando o item não tem nada do Hermes para mostrar — o caso
+ * comum quando nada está linkado ou o gateway está desligado. */
+function wiAgentLine(state, now = Date.now()) {
+    if (!state) return '';
+    const pending = wiPendingLabel(state.pending_reasons);
+    const events = wiAgentEventsLine(state.events, now);
+    return [pending ? `⏳ ${pending}` : '', events].filter(Boolean).join(' · ');
+}
+
+/** Work items com aprovação pendente que não apareceriam em NENHUMA das duas
+ * listas do resumo diário (nem "aguardando", nem tocados nos últimos dias) —
+ * sem isto, um item mais antigo ou que nunca entrou em espera nunca mostra
+ * que há uma decisão pendente nele. `shownWiIds` é o Set (ou array) de
+ * wi_id já desenhados pelas outras duas seções; `items` é a lista completa
+ * de work items (pra achar título/source de quem sobrou). Pura: não toca
+ * no DOM. */
+function wiExtraPendingItems(agentState, shownWiIds, items) {
+    const shown = shownWiIds instanceof Set ? shownWiIds : new Set(shownWiIds || []);
+    return Object.keys(agentState || {})
+        .filter(wiId => !shown.has(wiId) && (agentState[wiId].pending_reasons || []).length)
+        .map(wiId => ({ wiId, item: (items || []).find(x => x.id === wiId) }))
+        .filter(x => x.item);
+}
+
 /** Chave de agrupamento por dia local ('2026-07-29'); '' se ts inválido. */
 function wiDayKey(ts) {
     const d = new Date(ts);
@@ -785,6 +834,11 @@ class WorkItemsUI {
         try { overview = await window.pywebview.api.work_daily_digest(2); } catch (e) {}
         // Backward-compatible with a backend from before the overview envelope.
         if (Array.isArray(overview)) overview = { days: overview, waiting: [], counts: {} };
+        // Pendências de aprovação + últimos eventos do Hermes por work item (Task 6).
+        // Falha aqui (Hermes/gateway desligado, nada linkado) degrada para {} em
+        // silêncio: este painel nunca deve virar estado de erro por causa disso.
+        let agentState = {};
+        try { agentState = await window.pywebview.api.work_item_agent_state(); } catch (e) {}
         const counts = overview.counts || {};
         const digest = overview.days || [];
         const labelDay = ['hoje', 'ontem'];
@@ -802,9 +856,11 @@ class WorkItemsUI {
                         ? ((it.person || 'MSG').split(/\s+/)[0]).toUpperCase()
                         : 'TODO';
                 const last = it.last_activity ? wiWhen(it.last_activity * 1000) : '';
+                const agentLine = wiAgentLine(agentState[it.wi_id]);
                 html += `<div class="row daily-wait"><div class="tx">`
                     + `<div class="t1"><span class="k" style="color:${color}">${this._esc(key)}</span>${this._esc(it.title)}</div>`
                     + `<div class="t2">aguardando há ${wiSince(it.waiting_since)}${last ? ` · última atividade ${this._esc(last)}` : ''}</div>`
+                    + (agentLine ? `<div class="t2">${this._esc(agentLine)}</div>` : '')
                     + `</div></div>`;
             }
         }
@@ -820,9 +876,29 @@ class WorkItemsUI {
                     status: 'status', duedate: 'prazo', wait: 'aguardou',
                     resume: 'retomou', reopen: 'reabriu',
                 }[k] || k)).join(', ');
-                html += `<div class="row"><div class="tx"><div class="t1"><span class="k" style="color:${color}">${this._esc(key)}</span>${this._esc(it.title)} ${it.done ? '✓' : ''}</div><div class="t2">${this._esc(kinds)}</div></div></div>`;
+                const agentLine = wiAgentLine(agentState[it.wi_id]);
+                html += `<div class="row"><div class="tx"><div class="t1"><span class="k" style="color:${color}">${this._esc(key)}</span>${this._esc(it.title)} ${it.done ? '✓' : ''}</div><div class="t2">${this._esc(kinds)}</div>${agentLine ? `<div class="t2">${this._esc(agentLine)}</div>` : ''}</div></div>`;
             }
         });
+        // Uma aprovação pendente cujo item nem está "aguardando" nem foi tocado
+        // nos últimos dias (ex.: item ativo há mais tempo) não aparece em nenhuma
+        // das duas listas acima — sem esta seção, "que há uma decisão pendente"
+        // simplesmente não é visível em lugar nenhum do painel.
+        const shownWiIds = new Set([
+            ...(overview.waiting || []).map(it => it.wi_id),
+            ...digest.flatMap(d => d.items.map(it => it.wi_id)),
+        ]);
+        const extraPending = wiExtraPendingItems(agentState, shownWiIds, this.app.workItems.items);
+        if (extraPending.length) {
+            html += `<div class="daily-day">Pendências <span class="daily-date">fora do resumo</span></div>`;
+            for (const { wiId, item } of extraPending) {
+                const color = WI_COLOR[item.source] || 'var(--t-todo)';
+                const key = item.source === 'jira' ? (item.external_key || 'JIRA')
+                    : (item.source === 'teams' ? '💬' : 'TODO');
+                const agentLine = wiAgentLine(agentState[wiId]);
+                html += `<div class="row"><div class="tx"><div class="t1"><span class="k" style="color:${color}">${this._esc(key)}</span>${this._esc(item.title)}</div>${agentLine ? `<div class="t2">${this._esc(agentLine)}</div>` : ''}</div></div>`;
+            }
+        }
         listEl.innerHTML = html || '<div class="hint">nada nos últimos dias</div>';
     }
 }
@@ -834,5 +910,6 @@ if (typeof module !== 'undefined' && module.exports) {
         wiSquash, wiTokens, wiFold, wiWhen, wiSince, wiDayKey, wiDayHeader, wiDaysAgo,
         wiRecentPeople, wiShortNames, wiPersonRows, wiCapNameOnly, wiSnippet,
         wiTeamsExternalKey, wiFindExistingItem, wiExistingAction, WorkItemsUI,
+        wiAgentEventsLine, wiPendingLabel, wiAgentLine, wiExtraPendingItems,
     };
 }
