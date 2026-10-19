@@ -81,6 +81,86 @@ Hermes interfaces or use `/reload-mcp`. Stop Hermes normally, then close
 ClaudeManager so the gateway and WebSocket server shut down with the desktop
 app. No deploy, public listener, or remote host is involved.
 
+## Wake-up path (webhook publisher) setup
+
+ClaudeManager tails its own hook-event log and POSTs normalized wake-up events
+(`task_completed`, `permission_requested`, `process_exited`) to Hermes' native
+webhook platform, HMAC-signed over loopback. This starts a **new** Hermes turn;
+it never writes a prompt itself (only host-owned dispatch on approval does that,
+see above).
+
+1. **Enable the webhook platform via `.env`, not `config.yaml`** (keeps the
+   secret out of plaintext YAML):
+
+   ```text
+   # %LOCALAPPDATA%\hermes\.env
+   WEBHOOK_ENABLED=true
+   WEBHOOK_PORT=8644
+   WEBHOOK_SECRET=<same HMAC secret as below>
+   ```
+
+2. **ClaudeManager side:** put the same secret in
+   `%LOCALAPPDATA%\ClaudeManager\secrets.json`:
+
+   ```json
+   { "hermes_webhook": { "secret": "<same HMAC secret as above>" } }
+   ```
+
+   No secret configured -> the publisher stays off (fail-closed); the rest of
+   the app is unaffected.
+
+3. **Define the route statically in `config.yaml`** under
+   `platforms.webhook.extra.routes` (a static route cannot be overwritten by
+   `hermes webhook subscribe`, and only a config route supports declarative
+   `filters`):
+
+   ```yaml
+   platforms:
+     webhook:
+       extra:
+         routes:
+           claudemanager-events:
+             prompt: >
+               Evento do ClaudeManager: {event_type} na sessão {session_key}
+               (work item {work_item_id}, status {status}, {ts}). Leia o
+               contexto com list_sessions/list_work_items antes de agir -- o
+               evento pode estar velho. Não assuma aprovação: qualquer prompt
+               exige submit_proposal e aprovação humana na UI.
+             script: claudemanager_event_filter.py
+             filters:
+               - field: payload.event_type
+                 in: [task_completed, permission_requested, process_exited]
+               - field: payload.hermes_initiated
+                 equals: false
+   ```
+
+   No `secret:` key on the route -- it inherits the global `.env` secret above.
+
+4. **Copy the filter script** from
+   `integrations/hermes/claudemanager_event_filter.py` (the review copy kept
+   in this repo) to `HERMES_HOME/scripts/claudemanager_event_filter.py`. Path
+   traversal outside `HERMES_HOME/scripts/` is blocked, so it cannot live
+   anywhere else. It only dedups by `event_id` and applies a per-session
+   cooldown -- event-type selection and the recursion guard already live in
+   the declarative `filters` above.
+
+5. **Gateway durability on Windows:** `hermes gateway install` creates a real
+   Scheduled Task (`schtasks /Create ... /TN Hermes_Gateway`), logon trigger,
+   `LeastPrivilege`, **no UAC/elevation required**. Prefer it over running
+   `hermes gateway run` in a foreground console.
+
+6. **`hermes webhook test` cannot exercise this route.** It only works against
+   a *dynamic* subscription (reads its secret from
+   `webhook_subscriptions.json`) and signs in the GitHub format
+   (`X-Hub-Signature-256`), not the generic V2 format this route uses. There is
+   no CLI round-trip for a static route; the publisher's own delivery *is* the
+   test.
+
+With the gateway down, events simply accumulate in ClaudeManager's local log
+(nothing is dropped) and the publisher backs off; delivery resumes
+automatically once the gateway is back up, with no ClaudeManager restart
+needed.
+
 ## Acceptance evidence
 
 Automated checks are kept separate from manual application evidence. The local

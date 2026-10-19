@@ -175,8 +175,34 @@ def main():
         print(f"Agent gateway unavailable; Hermes integration disabled: {exc}")
         agent_gateway = None
 
+    # Wake-up publisher: tails the local hook-event log and POSTs normalized events
+    # (task_completed/permission_requested/process_exited) to Hermes' webhook route
+    # so a fresh Hermes turn starts without polling. Different credential than the
+    # agent gateway's Hermes token above, in the opposite direction. Missing secret
+    # disables it silently (fail-closed); any other failure must not affect the rest
+    # of the app, same defensive pattern as the agent gateway block above.
+    hermes_publisher = None
+    try:
+        from terminal.hermes_events import HermesEventsPublisher
+        from terminal import secrets_store
+        webhook_secret = secrets_store.hermes_webhook_secret()
+        if webhook_secret:
+            hermes_publisher = HermesEventsPublisher(webhook_secret)
+            hermes_publisher.start()
+            print("Hermes event publisher started")
+        else:
+            print("Hermes webhook secret not configured; event publisher disabled")
+    except Exception as exc:
+        print(f"Hermes event publisher unavailable: {exc}")
+        hermes_publisher = None
+
     # Create bridge (JS API)
     bridge = Bridge(pty_manager, ws_server)
+    # The publisher fails closed and *stays* closed on a configuration error (a wrong
+    # secret or a missing route cannot be fixed by retrying). That is only an
+    # improvement over silent retries if the operator can see it, so hand the
+    # instance to the bridge for read-only status exposure.
+    bridge.set_hermes_publisher(hermes_publisher)
 
     # Create pywebview window
     web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -201,6 +227,11 @@ def main():
         if agent_gateway is not None:
             try:
                 agent_gateway.stop()
+            except Exception:
+                pass
+        if hermes_publisher is not None:
+            try:
+                hermes_publisher.stop()
             except Exception:
                 pass
         try:

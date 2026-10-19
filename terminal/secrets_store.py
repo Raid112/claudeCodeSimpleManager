@@ -8,7 +8,8 @@ still runs with manual TODOs only.
 Schema:
 {
   "jira":  { "email": "...", "token": "<manual API token>" },
-  "graph": { "client_id": "...", "tenant_id": "..." }
+  "graph": { "client_id": "...", "tenant_id": "..." },
+  "hermes_webhook": { "secret": "<HMAC secret shared with Hermes' WEBHOOK_SECRET>" }
 }
 """
 
@@ -52,4 +53,18 @@ def graph_ids() -> tuple[str, str] | None:
     cid, tid = g.get("client_id"), g.get("tenant_id")
     if cid and tid:
         return cid, tid
+    return None
+
+
+def hermes_webhook_secret() -> str | None:
+    """HMAC secret used to sign ClaudeManager -> Hermes webhook events, or None.
+
+    None means the wake-up publisher stays off (fail-closed): this is a
+    different credential than the Hermes gateway read token in
+    terminal/hermes_runtime.py, used in the opposite direction (this app calls
+    out to Hermes' webhook platform, rather than Hermes calling in)."""
+    w = load().get("hermes_webhook") or {}
+    secret = w.get("secret")
+    if secret:
+        return secret
     return None

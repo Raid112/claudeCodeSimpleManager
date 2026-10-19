@@ -175,6 +175,23 @@ def verify_audit_chain() -> bool:
     return True
 
 
+def read_audit_events() -> list[dict]:
+    """Public, read-only view of the full audit chain, every event kind.
+
+    Unlike ``list_pending_decisions()`` (which deliberately excludes
+    ``EXECUTED`` decisions -- not what its callers need), this exposes
+    ``execution_result``/``automatic_action`` events too. Added for a
+    consumer like the Hermes-events recursion guard, which needs to see a
+    completed host prompt write and previously had no legitimate way to do
+    that short of reaching into the private lock and file reader. Read-only:
+    exposes no write path, and still runs the same hash-chain verification
+    (``_read_events_unlocked``) as every other read in this module -- a
+    corrupt or tampered journal still raises ``AuditIntegrityError`` here.
+    """
+    with _PROCESS_LOCK, _FileLock():
+        return copy.deepcopy(_read_events_unlocked())
+
+
 def _append_event_unlocked(kind: str, payload: dict, *, actor: str = "claudemanager",
                            role: str = "host", capability: str | None = None,
                            policy_version: str = "1", execution_id: str | None = None) -> dict:

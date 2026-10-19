@@ -70,9 +70,30 @@ class Bridge:
         self._toaster = None  # lazily created WindowsToaster (windows_toasts)
         self._operator_capabilities: dict[str, dict] = {}
         self._emergency_capability = secrets.token_urlsafe(32)
+        self._hermes_publisher = None  # set by main.py; see set_hermes_publisher
 
     def set_window(self, window: webview.Window):
         self._window = window
+
+    def set_hermes_publisher(self, publisher):
+        """Hold the wake-up publisher for read-only status exposure (see
+        get_hermes_publisher_status). None means it never started."""
+        self._hermes_publisher = publisher
+
+    def get_hermes_publisher_status(self) -> dict:
+        """Read-only publisher state for the UI.
+
+        A publisher that disabled itself on 401/403/404 will never recover on its
+        own, so this is the only place an operator can find out. `state: "off"`
+        means it was never started (no secret in secrets.json -- the intended off
+        switch), which is not an error."""
+        publisher = self._hermes_publisher
+        if publisher is None:
+            return {"state": "off", "reason": "not_configured"}
+        try:
+            return publisher.status()
+        except Exception as exc:
+            return {"state": "unknown", "reason": type(exc).__name__}
 
     def notify_state(self, session_id: str, tab_name: str, state: str):
         """Show a Windows toast for a backgrounded session transition.
