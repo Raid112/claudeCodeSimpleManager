@@ -107,6 +107,8 @@ class TabBar {
                 html += `<span class="tab-label" data-id="${id}">${keyPrefix}${this._esc(labelName)}</span>`;
                 html += timerHtml;
                 html += linkHtml;
+                html += `<span class="tab-repaint" data-id="${id}" title="Redesenhar terminal (layout quebrado)">⟳</span>`;
+                html += `<span class="tab-restart" data-id="${id}" title="Reiniciar processo (lento/travado): mata e retoma a mesma sessão">⏻</span>`;
                 html += `<span class="tab-close" data-id="${id}" title="Fechar">×</span>`;
             }
             html += `</div>`;
@@ -204,6 +206,28 @@ class TabBar {
                 e.preventDefault();
                 e.stopPropagation();
                 this._startRename(el, el.dataset.id);
+            });
+        });
+
+        // Repaint button -> force a full redraw of a garbled terminal (no restart)
+        this.container.querySelectorAll('.tab-repaint').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const entry = this.app.terminals && this.app.terminals[el.dataset.id];
+                const inst = entry && entry.instance;
+                if (inst && typeof inst.repaint === 'function') inst.repaint();
+            });
+        });
+
+        // Restart button -> kill + respawn the CLI with --resume under the same tab
+        this.container.querySelectorAll('.tab-restart').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const entry = this.app.terminals && this.app.terminals[el.dataset.id];
+                const inst = entry && entry.instance;
+                if (!inst || typeof inst.restart !== 'function') return;
+                if (!confirm('Reiniciar o processo desta aba? A conversa é retomada; um turno em andamento é interrompido.')) return;
+                inst.restart();
             });
         });
 

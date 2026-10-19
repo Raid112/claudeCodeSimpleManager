@@ -576,6 +576,22 @@ body.col-resizing {
     background: rgba(239, 68, 68, 0.15);
 }
 
+.tab .tab-repaint,
+.tab .tab-restart {
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 2px;
+    line-height: 1;
+    border-radius: 3px;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+}
+.tab:hover .tab-repaint, .tab.active .tab-repaint,
+.tab:hover .tab-restart, .tab.active .tab-restart { opacity: 1; }
+.tab .tab-repaint:hover { color: var(--text); }
+.tab .tab-restart:hover { color: var(--red, #ef4444); }
+
 /* Rename inputs */
 .tab-rename-input,
 .sidebar-rename-input {

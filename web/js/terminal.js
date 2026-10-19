@@ -539,6 +539,43 @@ class TerminalInstance {
         } catch (e) { /* instrumentation must never break fit */ }
     }
 
+    /** Manual "reset" for a garbled tab: re-fit, wipe xterm's glyph cache and repaint, then
+     * nudge the PTY size (cols-1 -> cols) so the Claude TUI does a full redraw. Doesn't touch
+     * the PTY process or scrollback; same effect as the switch-tabs workaround, on demand. */
+    repaint() {
+        this.fit();
+        try { if (typeof this.term.clearTextureAtlas === 'function') this.term.clearTextureAtlas(); } catch (e) { /* optional API */ }
+        this.term.refresh(0, this.term.rows - 1);
+        const { cols, rows } = this.term;
+        const open = !!(this.ws && this.ws.readyState === WebSocket.OPEN);
+        if (open && cols > 1) {
+            this.ws.send(JSON.stringify({ type: 'resize', cols: cols - 1, rows }));
+            setTimeout(() => {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }));
+                }
+            }, 60);
+        }
+        if (typeof UiLog !== 'undefined') UiLog.push('tab.repaint', { session: this.sessionId, cols, rows, ws: this.ws ? this.ws.readyState : -1 });
+        this.term.focus();
+    }
+
+    /** Kill and respawn the provider process under this same tab, resuming the session.
+     * For a CLI that got slow or stuck (repaint can't help: the bottleneck is the process).
+     * The websocket stays open — the backend swaps the PTY underneath it. */
+    async restart() {
+        if (!(window.pywebview && window.pywebview.api && window.pywebview.api.restart_terminal)) return false;
+        this.fit();
+        const { cols, rows } = this.term;
+        // Wipe before the new process starts printing, so its resume redraw lands on a clean screen.
+        this.term.reset();
+        this.backendState = null;
+        const ok = await window.pywebview.api.restart_terminal(this.sessionId, cols, rows);
+        if (typeof UiLog !== 'undefined') UiLog.push('tab.restart', { session: this.sessionId, cols, rows, ok: !!ok });
+        this.term.focus();
+        return !!ok;
+    }
+
     focus() {
         this.term.focus();
     }

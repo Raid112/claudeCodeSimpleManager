@@ -5,6 +5,7 @@ specific session identifiers. Keeping this logic pure/read-only makes it safe
 to test without starting an interactive CLI.
 """
 
+import base64
 import json
 import sqlite3
 from pathlib import Path
@@ -34,6 +35,21 @@ def build_resume_command(
     if terminal_type == "opencode":
         return f"opencode -s {session_id}" if session_id else "opencode"
     return ""
+
+
+def build_powershell_command(command: str) -> str:
+    """Build a UTF-8-safe PowerShell command line for the PTY host."""
+    script = (
+        "[Console]::InputEncoding=[System.Text.Encoding]::UTF8;"
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "$OutputEncoding=[System.Text.Encoding]::UTF8;"
+        "chcp 65001 > $null;"
+    )
+    if command:
+        script += command
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    no_exit = " -NoExit" if not command else ""
+    return f"-NoLogo -NoProfile{no_exit} -EncodedCommand {encoded}"
 
 
 def _codex_id_from_file(path: Path) -> str | None:

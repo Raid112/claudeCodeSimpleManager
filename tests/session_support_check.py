@@ -1,6 +1,7 @@
 """Checks for provider session discovery and resume command construction."""
 
 import json
+import base64
 import sqlite3
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from terminal.session_support import (
+    build_powershell_command,
     build_resume_command,
     find_codex_session_id,
     find_opencode_session_id,
@@ -23,6 +25,11 @@ def check(name: str, condition: bool) -> None:
 
 
 def main() -> int:
+    encoded = build_powershell_command("claude --resume claude-1").split()[-1]
+    bootstrap = base64.b64decode(encoded).decode("utf-16le")
+    check("PowerShell bootstrap configures UTF-8", "InputEncoding" in bootstrap and "OutputEncoding" in bootstrap)
+    check("PowerShell bootstrap preserves provider command", bootstrap.endswith("claude --resume claude-1"))
+    check("PowerShell terminal remains interactive", "-NoExit" in build_powershell_command(""))
     check("Claude fresh keeps hooks", build_resume_command("claude", hooks_path="hooks.json") == 'claude --settings "hooks.json"')
     check("Claude new session keeps owned id", build_resume_command("claude", session_id="claude-1", resume_session=False) == "claude --session-id claude-1")
     check("Claude resume keeps id", build_resume_command("claude", session_id="claude-1") == "claude --resume claude-1")

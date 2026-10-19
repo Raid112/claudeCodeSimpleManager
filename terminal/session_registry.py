@@ -89,6 +89,21 @@ class SessionRegistry:
             self._closing.add(key)
             return True
 
+    def is_closing(self, session_key: str) -> bool:
+        """True while a session is between begin_close() and finish_close().
+
+        Lets a concurrent observer (PtyManager's process_exited producer) tell
+        an intentional close apart from an unexpected PTY death: begin_close()
+        is set before the PTY is touched, so this closes the race window where
+        a snapshot of sessions taken just before removal is still evaluated
+        after the close started."""
+        try:
+            key = _validate(session_key, "session_key")
+        except ValueError:
+            return False
+        with self._lock:
+            return key in self._closing
+
     def finish_close(self, session_key: str) -> None:
         key = _validate(session_key, "session_key")
         with self._lock:

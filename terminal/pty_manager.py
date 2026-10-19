@@ -9,6 +9,7 @@ which `get_all_sessions` reads back. There is no longer any need to poll the
 """
 
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -25,10 +26,30 @@ from terminal.input_protocol import prepare_composer_message, InputProtocolError
 from terminal.session_registry import SessionRegistry
 from terminal.session_support import (
     build_resume_command,
+    build_powershell_command,
     find_codex_session_id,
     find_opencode_session_id,
     list_opencode_session_ids,
 )
+
+
+def build_child_env(base: dict, tab_id: str, session_key: str) -> str:
+    """Build the null-separated environment block pywinpty's `spawn(env=...)` expects.
+
+    pywinpty's `env` replaces the *whole* child environment (it is not overlaid on
+    the parent's), so callers must seed `base` from `dict(os.environ)` to keep
+    everything the child normally inherits (PATH, SystemRoot, ...). Only the two
+    tab-identity vars are added on top. Windows also carries pseudo-variables whose
+    NAME starts with `=` (e.g. `=C:`, `=ExitCode` — per-drive cwd tracking); these
+    are not valid `name=value` pairs for CreateProcessW's env block and are dropped.
+    Format per winpty.PTY.spawn's docstring: each `name=value` pair separated by a
+    single `\0`, plus a trailing `\0`.
+    """
+    merged = dict(base)
+    merged["CLAUDEMANAGER_TAB"] = tab_id
+    merged["CLAUDEMANAGER_SESSION_KEY"] = session_key
+    entries = [f"{k}={v}" for k, v in merged.items() if not k.startswith("=")]
+    return "\0".join(entries) + "\0"
 
 
 def _codex_sessions_root() -> Path:
@@ -40,6 +61,23 @@ def _opencode_database_path() -> Path:
     if data_root:
         return Path(data_root) / "opencode" / "opencode.db"
     return Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+
+def _kill_tree(pty) -> None:
+    """Force-kill the PTY's powershell and everything under it (claude, node, MCP
+    servers). Writing "exit" like PtySession.kill() does would just be typed into claude."""
+    try:
+        pid = pty.pid
+    except Exception:
+        return
+    if not pid:
+        return
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       capture_output=True, timeout=10,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
 
 
 class PtySession:
@@ -67,30 +105,66 @@ class PtySession:
         self.claude_session_id = claude_session_id
         self.agent_session_id = agent_session_id or claude_session_id
         self.session_key = session_key or str(uuid.uuid4())
-        self.pty = winpty.PTY(cols, rows)
+        self.hooks_settings_path = hooks_settings_path
+        # True only while restart() swaps the PTY: the ws reader polls is_alive between
+        # reads, and the old process dying mid-swap must not close the tab's websocket.
+        self._respawning = False
+        self.pty = self._spawn(cols, rows, continue_session, resume)
 
+    def _spawn(self, cols: int, rows: int, continue_session: bool, resume: bool):
+        pty = winpty.PTY(cols, rows)
         cmdline = build_resume_command(
-            terminal_type,
-            session_id=(claude_session_id if terminal_type == "claude" else agent_session_id),
+            self.terminal_type,
+            session_id=(self.claude_session_id if self.terminal_type == "claude" else self.agent_session_id),
             continue_session=continue_session,
-            hooks_path=hooks_settings_path,
+            hooks_path=self.hooks_settings_path,
             resume_session=resume,
         )
 
-        # Tag the child env with this tab's id so the Claude Code hooks (grandchildren
-        # of powershell) can report WHICH tab they belong to, independent of the
-        # session_id they carry — which the user can swap via /clear or /resume.
-        # Set on the parent right before spawn (env=None => child snapshots parent env);
-        # create_session is synchronous, so no interleaving with another spawn.
-        os.environ["CLAUDEMANAGER_TAB"] = self.id
-        self.pty.spawn(
+        # Tag the child env with this tab's id (and the stable session_key) so the
+        # Claude Code hooks (grandchildren of powershell) can report WHICH tab they
+        # belong to, independent of the session_id they carry — which the user can
+        # swap via /clear or /resume. Passed explicitly per spawn rather than
+        # mutated on os.environ: create_session runs on whichever thread calls it
+        # (the pywebview bridge thread for UI-initiated sessions, the
+        # ThreadingHTTPServer handler thread for agent_gateway-initiated ones), so
+        # two concurrent creations mutating the same global os.environ would race
+        # and cross-assign tab ids between sessions.
+        env_block = build_child_env(os.environ, self.id, self.session_key)
+        powershell_cmdline = build_powershell_command(cmdline)
+        pty.spawn(
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            cmdline=cmdline,
-            cwd=path,
+            cmdline=powershell_cmdline,
+            cwd=self.path,
+            env=env_block,
         )
+        return pty
+
+    def restart(self, cols: int, rows: int):
+        """Kill the provider process and start it again under the SAME tab id and
+        session_key, resuming the current conversation. For a CLI that got slow or
+        stuck: the tab, its websocket and its work-item link all survive; only the
+        process underneath is new. Kill before spawn so two claudes never write the
+        same session transcript at once."""
+        self._respawning = True
+        try:
+            _kill_tree(self.pty)
+            delete_state(self.id)  # the new process is idle until its first hook
+            resume_id = self.claude_session_id if self.terminal_type == "claude" else self.agent_session_id
+            self.pty = self._spawn(
+                cols, rows,
+                continue_session=(self.terminal_type == "claude" and not resume_id),
+                resume=bool(resume_id),
+            )
+            ui_log.log("pty.restart", src="py", session=self.id, cols=cols, rows=rows,
+                       resumed=bool(resume_id))
+        finally:
+            self._respawning = False
 
     @property
     def is_alive(self) -> bool:
+        if self._respawning:
+            return True
         try:
             return self.pty.isalive()
         except Exception:
@@ -137,6 +211,12 @@ class PtyManager:
         self.sessions: dict[str, PtySession] = {}
         self.hooks_settings_path = hooks_settings_path
         self.registry = SessionRegistry()
+        # process_exited producer (Hermes plan Task 4): report-once set + its
+        # own lock, guarding get_all_sessions() against double-emitting when
+        # the pywebview poll thread and an agent_gateway handler thread call
+        # it concurrently for the same dead session.
+        self._exit_reported: set[str] = set()
+        self._exit_report_lock = threading.Lock()
 
     def create_session(
         self,
@@ -224,6 +304,14 @@ class PtyManager:
     def get_session(self, session_id: str) -> PtySession | None:
         return self.sessions.get(session_id)
 
+    def restart_session(self, session_id: str, cols: int, rows: int) -> bool:
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
+        with self.registry.lock_for(session.session_key):
+            session.restart(cols, rows)
+        return True
+
     def close_session(self, session_id: str):
         session = self.sessions.get(session_id)
         if not session or not self.registry.begin_close(session.session_key):
@@ -234,6 +322,42 @@ class PtyManager:
             session.kill()
         finally:
             self.registry.finish_close(session.session_key)
+            with self._exit_report_lock:
+                # session_key is a fresh uuid4 per spawn (never reused), so this
+                # is just hygiene against an unbounded set over the app's lifetime,
+                # not a correctness requirement.
+                self._exit_reported.discard(session.session_key)
+
+    def _maybe_report_exit(self, session: "PtySession", alive: bool) -> None:
+        """Emit exactly one ``process_exited`` event for an UNEXPECTED PTY
+        alive->dead transition (Hermes plan Task 4). Called from
+        ``get_all_sessions``, which is polled every 2s from the pywebview UI
+        thread AND called from the agent_gateway's ThreadingHTTPServer handler
+        threads -- so this must never raise, and two concurrent callers seeing
+        the same dead session must still only produce one event.
+
+        An intentional close (``close_session`` / ``close_all``, both routed
+        through ``registry.begin_close``) removes the session from
+        ``self.sessions`` before the PTY is ever touched, so the closing
+        thread itself never observes its own session here. The remaining race
+        is a concurrent ``get_all_sessions`` call that snapshotted
+        ``self.sessions`` (see the ``list(...)`` in that method) just before
+        the removal, then evaluates ``is_alive`` after the close already
+        began -- ``registry.is_closing`` closes exactly that window.
+        """
+        if alive:
+            return
+        key = session.session_key
+        try:
+            with self._exit_report_lock:
+                if key in self._exit_reported or self.registry.is_closing(key):
+                    return
+                self._exit_reported.add(key)
+            from terminal import work_items
+            from terminal.hermes_events import PROCESS_EXITED_EVENT
+            work_items.log_event(key, PROCESS_EXITED_EVENT, claude_session_id=session.claude_session_id)
+        except Exception:
+            pass
 
     def find_by_session_key(self, session_key: str) -> PtySession | None:
         return self.registry.find_by_session_key(session_key)
@@ -322,12 +446,14 @@ class PtyManager:
                 except Exception:
                     pass
                 s.claude_session_id = cur
+            alive = s.is_alive
+            self._maybe_report_exit(s, alive)
             result.append(
                 {
                     "id": s.id,
                     "group_name": s.group_name,
                     "path": s.path,
-                    "is_alive": s.is_alive,
+                    "is_alive": alive,
                     "claude_session_id": s.claude_session_id,
                     "agent_session_id": s.agent_session_id,
                     "session_key": s.session_key,
