@@ -2,7 +2,7 @@
 
 **Objetivo:** trocar o canal de fora pra dentro (PTY + hooks `--settings` + heurística de output) por um mod do Claude Code dentro de cada aba claude, com 4 entregas: (1) estado exato, (2) prompt sem PTY, (3) aprovação de tool pela UI, (4) uso por aba.
 
-**Build de referência:** Claude Code 2.1.303. A API de mods muda por build: os tipos ficam fixados em `mods/claudemanager-bridge/.claude-plugin/types/` e o `hello` do mod manda `$.session.version()`, pra o manager avisar quando a build mudar.
+**Build de referência:** Claude Code 2.1.303. A API de mods muda por build: o engine reescreve `mods/claudemanager-bridge/.claude-plugin/types/` a cada load (gitignored, porque inclui os MCPs do usuário), e o `hello` do mod manda `$.session.version()`, pra o manager avisar quando a build mudar.
 
 **Fora do escopo:** abas codex/opencode/powershell (seguem no PTY e na heurística). Hermes aprovando tool (nunca). Regras "sempre permitir" criadas pela UI (v1 não).
 
@@ -200,6 +200,8 @@ Spike reproduzível em `Docs/plans/2026-10-19-ClaudeManagerMod-spike/` (mod `cm-
 ---
 
 ## 9. Ordem, gates e rollback
+
+**Estado em 2026-10-19:** Fases 1 e 2 implementadas na branch `feat/claude-mod`, com 7 testes do mod, 45 checks em `tests/mod_bridge_check.py` e um e2e com `claude` real (hello, running → ready, uso, troca de id no `/clear`, restart retomando). Flag `claude_mod.enabled` ainda desligada.
 
 1. Fase 0 (spikes): feita, gate passou (S1 via `--plugin-dir`, S2 ok, S3 via eventos nativos). Falta o S4b manual.
 2. Fase 1 + Fase 2 juntas (o transporte sem consumidor não se prova) → liga `claude_mod.enabled` só numa aba de teste. Critério: uma semana sem aba presa em estado errado; o Hermes recebe o mesmo número de `task_completed` que antes.
