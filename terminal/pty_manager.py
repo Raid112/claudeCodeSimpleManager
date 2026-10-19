@@ -430,6 +430,26 @@ class PtyManager:
             })
             return result.get("execution") or accepted
 
+    def send_owned_prompt(self, session_key: str, text: str) -> bool:
+        """Write one prompt into a Hermes-owned tab with no approval decision.
+
+        Ownership, group allow-list and idempotency are the gateway's job; this
+        only refuses non-conversational tabs and serializes with other writes to
+        the same session. Returns whether the host accepted the PTY write.
+        """
+        session = self.find_by_session_key(session_key)
+        if session is None:
+            raise KeyError(session_key)
+        if session.terminal_type == "powershell":
+            raise PermissionError("PowerShell is not a conversational provider")
+        prepared = prepare_composer_message(
+            text, bracketed_paste_mode=True, provider=session.terminal_type)
+        with self.registry.lock_for(session_key):
+            try:
+                return bool(session.write(prepared))
+            except Exception:
+                return False
+
     def get_all_sessions(self) -> list[dict]:
         result = []
         for s in list(self.sessions.values()):

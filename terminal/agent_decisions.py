@@ -424,6 +424,74 @@ def list_pending_decisions() -> list[dict]:
         return result
 
 
+def record_automatic_action(action_type: str, request_id: str, payload: dict) -> dict:
+    """Append-only record of an automatic action (no proposal, no approval, no
+    operator capability) into the same hash chain as approved prompts.
+
+    ``payload`` is the public response the route returned to its caller; storing
+    it under ``result`` lets a replay of the same ``request_id`` return the
+    identical response instead of repeating the underlying action (see
+    ``find_automatic_action``). Losing ``create_proposal``'s emergency-stop gate
+    for these actions must not mean losing either the gate or the record, so both
+    are enforced here, under the lock, exactly like every other journal write.
+    """
+    if not isinstance(action_type, str) or not action_type:
+        raise ValueError("action_type is required")
+    if not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("request_id is required")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    with _PROCESS_LOCK, _FileLock():
+        if _control_state_unlocked()["emergency_stopped"]:
+            raise AuthorizationError("emergency stop is active")
+        event_payload = {
+            "action_type": action_type,
+            "request_id": request_id,
+            "result": copy.deepcopy(payload),
+        }
+        return _append_event_unlocked("automatic_action", event_payload)
+
+
+def find_automatic_action(request_id: str) -> dict | None:
+    """Return a previously recorded automatic action for ``request_id``, or None.
+
+    This is the idempotency mechanism for automatic routes: replaying the same
+    ``request_id`` must return the same result rather than repeat the action
+    (e.g. open a second tab). ``automatic_action`` events carry no decision_id,
+    so they are invisible to ``_states_from_events`` and must be found here by a
+    direct scan of the chain instead.
+    """
+    with _PROCESS_LOCK, _FileLock():
+        for event in _read_events_unlocked():
+            if event["kind"] != "automatic_action":
+                continue
+            payload = event["payload"]
+            if isinstance(payload, dict) and payload.get("request_id") == request_id:
+                return copy.deepcopy(payload)
+        return None
+
+
+def hermes_opened_session(session_key: str) -> bool:
+    """True when the journal holds an ``open_session`` automatic action for this
+    session_key, i.e. Hermes itself opened the tab through the gateway.
+
+    Ownership is what scopes the approval-free prompt lane: a tab the user opened
+    by hand is never reachable without approval, however it is addressed.
+    """
+    if not isinstance(session_key, str) or not session_key:
+        return False
+    with _PROCESS_LOCK, _FileLock():
+        for event in _read_events_unlocked():
+            if event["kind"] != "automatic_action":
+                continue
+            payload = event["payload"]
+            if (isinstance(payload, dict)
+                    and payload.get("action_type") == "open_session"
+                    and (payload.get("result") or {}).get("session_key") == session_key):
+                return True
+        return False
+
+
 def _find_feedback(state: dict, feedback_id: str) -> dict | None:
     return next((item for item in state["feedback"] if item["feedback_id"] == feedback_id), None)
 

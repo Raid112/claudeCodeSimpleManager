@@ -31,12 +31,12 @@ def proposal(version=1, parent=None, idem=None):
             "content_hash": "b" * 64,
             "trust": "external_data",
         }],
-        "intent": "Open a managed session",
+        "intent": "Send an approved prompt to the managed session",
         "action": {
-            "type": "open_session",
-            "target": {"group_id": "group-1"},
-            "parameters": {},
-            "expected_outcome": "Session opened",
+            "type": "send_prompt",
+            "target": {"session_key": "session-1"},
+            "parameters": {"text": "Approved prompt text"},
+            "expected_outcome": "The prompt reaches the session",
             "reversible": True,
         },
         "risk": {"level": "low", "factors": []},
@@ -196,6 +196,40 @@ def test_replan_attempts_are_bounded_and_parent_cannot_approve_child():
             pass
         else:
             raise AssertionError("rejected child must not be approved")
+    finally:
+        root.cleanup()
+
+
+def test_automatic_action_is_journaled_idempotent_and_chain_stays_valid():
+    root = setup()
+    try:
+        result = {"session_key": "created-session-1", "group_id": "group-1", "state": "DISPATCHED"}
+        recorded = agent_decisions.record_automatic_action("open_session", "req-1", result)
+        assert recorded["kind"] == "automatic_action"
+        assert recorded["payload"]["request_id"] == "req-1"
+        assert recorded["payload"]["action_type"] == "open_session"
+
+        found = agent_decisions.find_automatic_action("req-1")
+        assert found["result"] == result
+        assert agent_decisions.find_automatic_action("no-such-request") is None
+
+        # automatic_action has no decision_id: state reconstruction must not choke on it.
+        assert agent_decisions.verify_audit_chain()
+    finally:
+        root.cleanup()
+
+
+def test_automatic_action_is_blocked_by_emergency_stop():
+    root = setup()
+    try:
+        agent_decisions.set_emergency_stop("tester", "cap-stop")
+        try:
+            agent_decisions.record_automatic_action("open_session", "req-2", {"ok": True})
+        except agent_decisions.AuthorizationError:
+            pass
+        else:
+            raise AssertionError("automatic action must respect the emergency stop")
+        assert agent_decisions.find_automatic_action("req-2") is None
     finally:
         root.cleanup()
 

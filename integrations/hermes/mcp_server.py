@@ -26,7 +26,9 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-from terminal.agent_contracts import MODEL_NAME, MODEL_PROVIDER, proposal_hash
+from terminal.agent_contracts import (
+    EXECUTION_SENT, EXECUTION_UNKNOWN, MODEL_NAME, MODEL_PROVIDER, STATUS_APPROVED, proposal_hash,
+)
 
 
 class McpProtocolError(ValueError):
@@ -97,31 +99,42 @@ class McpServer:
             "properties": {"decision_id": {"type": "string", "minLength": 1, "maxLength": 128}},
             "required": ["decision_id"], "additionalProperties": False,
         }
+        # open_session is automatic now: no decision_id/proposal_hash, because there
+        # is no proposal and no approval for it anymore.
         open_schema = {
             "type": "object",
             "properties": {
-                "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                "proposal_hash": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
                 "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 "group_id": {"type": "string", "minLength": 1, "maxLength": 128},
             },
-            "required": ["decision_id", "proposal_hash", "request_id", "group_id"],
+            "required": ["request_id", "group_id"],
             "additionalProperties": False,
         }
-        prompt_schema = {
+        # link_work_item is automatic too, same shape as open_session: no
+        # decision_id/proposal_hash, because there is no proposal for it either.
+        link_schema = {
             "type": "object",
             "properties": {
-                "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                "proposal_hash": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
                 "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
                 "session_key": {"type": "string", "minLength": 1, "maxLength": 128},
-                "text": {"type": "string", "minLength": 1, "maxLength": 12000},
+                "work_item_id": {"type": "string", "minLength": 1, "maxLength": 128},
             },
-            "required": ["decision_id", "proposal_hash", "request_id", "session_key", "text"],
+            "required": ["request_id", "session_key", "work_item_id"],
+            "additionalProperties": False,
+        }
+        owned_prompt_schema = {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "session_key": {"type": "string", "minLength": 1, "maxLength": 128},
+                "text": {"type": "string", "minLength": 1, "maxLength": 16000},
+            },
+            "required": ["request_id", "session_key", "text"],
             "additionalProperties": False,
         }
         return [
             {"name": "get_health", "description": "Read host gateway health", "inputSchema": {"type": "object"}},
+            {"name": "send_owned_prompt", "description": "Send a prompt, with no approval, to a tab YOU opened with open_session in an allow-listed group (see get_health.auto_prompt_groups); idempotent per request_id. Tabs the user opened still need submit_proposal", "inputSchema": owned_prompt_schema},
             {"name": "list_sessions", "description": "List managed session snapshots", "inputSchema": {"type": "object"}},
             {"name": "list_work_items", "description": "Read work-item context", "inputSchema": {"type": "object"}},
             {"name": "get_work_overview", "description": "Read the daily work overview", "inputSchema": {"type": "object"}},
@@ -130,8 +143,9 @@ class McpServer:
             {"name": "search_teams", "description": "Search Teams context read-only", "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}},
             {"name": "submit_proposal", "description": "Submit an immutable action proposal for local approval", "inputSchema": {"type": "object", "properties": {"proposal": {"type": "object"}}, "required": ["proposal"]}},
             {"name": "get_decision", "description": "Read the redacted state of one proposal after local review", "inputSchema": decision_schema},
-            {"name": "open_session", "description": "Open one configured conversational session after local approval", "inputSchema": open_schema},
-            {"name": "send_prompt", "description": "Send the exact approved prompt to one managed session", "inputSchema": prompt_schema},
+            {"name": "open_session", "description": "Open one configured conversational session automatically — no proposal, no approval; idempotent per request_id and journaled by the host", "inputSchema": open_schema},
+            {"name": "link_work_item", "description": "Link a managed session to a Work Item automatically — no proposal, no approval; idempotent per request_id and journaled by the host", "inputSchema": link_schema},
+            {"name": "get_execution_receipt", "description": "Read the host's dispatch receipt for an approved send_prompt decision — the host dispatches on approval, this tool never triggers a write", "inputSchema": decision_schema},
             {"name": "get_replan", "description": "Retrieve actionable rejection feedback for replanning", "inputSchema": {"type": "object", "properties": {"decision_id": {"type": "string"}}, "required": ["decision_id"]}},
         ]
 
@@ -205,19 +219,33 @@ class McpServer:
                 "GET", "/v1/proposals/" + urllib.parse.quote(decision_id, safe=""))
             return self._business_result(status, data)
         if name == "open_session":
-            self._validate_execution_args(args, "open_session", {"group_id"})
-            payload = {key: args[key] for key in
-                       ("decision_id", "proposal_hash", "request_id", "group_id")}
+            self._validate_automatic_args(args, "open_session", {"group_id"})
+            payload = {key: args[key] for key in ("request_id", "group_id")}
             status, data = self._request_fn("POST", "/v1/sessions", payload)
             return self._business_result(status, data)
-        if name == "send_prompt":
-            self._validate_execution_args(args, "send_prompt", {"session_key", "text"})
-            session_key = args["session_key"]
-            payload = {key: args[key] for key in
-                       ("decision_id", "proposal_hash", "request_id", "text")}
-            status, data = self._request_fn(
-                "POST", "/v1/sessions/" + urllib.parse.quote(session_key, safe="") + "/prompt", payload)
+        if name == "link_work_item":
+            self._validate_automatic_args(args, "link_work_item", {"session_key", "work_item_id"})
+            payload = {key: args[key] for key in ("request_id", "session_key", "work_item_id")}
+            status, data = self._request_fn("POST", "/v1/work-items/link", payload)
             return self._business_result(status, data)
+        if name == "send_owned_prompt":
+            text = args.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+                raise McpProtocolError("send_owned_prompt.text is invalid")
+            ids = {key: value for key, value in args.items() if key != "text"}
+            self._validate_automatic_args(ids, "send_owned_prompt", {"session_key"})
+            path = "/v1/sessions/" + urllib.parse.quote(ids["session_key"], safe="") + "/prompt"
+            status, data = self._request_fn(
+                "POST", path, {"request_id": ids["request_id"], "text": text})
+            return self._business_result(status, data)
+        if name == "get_execution_receipt":
+            decision_id = self._strict_identifier_args(args, {"decision_id"}, "get_execution_receipt")
+            status, data = self._request_fn(
+                "GET", "/v1/proposals/" + urllib.parse.quote(decision_id, safe=""))
+            if status >= 400:
+                return self._business_result(status, data)
+            receipt = self._receipt_from_decision(data.get("decision") or {})
+            return self._business_result(200, receipt)
         if name == "get_replan":
             decision_id = args.get("decision_id")
             if not isinstance(decision_id, str) or not decision_id:
@@ -257,12 +285,43 @@ class McpServer:
     @staticmethod
     def _contains_unknown(value) -> bool:
         if isinstance(value, dict):
-            if value.get("state") == "UNKNOWN":
+            # "UNKNOWN" is the raw journal execution state (still visible via
+            # get_decision); PROVIDER_PROCESSING_UNKNOWN is the same honesty
+            # expressed in get_execution_receipt's own vocabulary.
+            if value.get("state") in {"UNKNOWN", "PROVIDER_PROCESSING_UNKNOWN"}:
                 return True
             return any(McpServer._contains_unknown(item) for item in value.values())
         if isinstance(value, list):
             return any(McpServer._contains_unknown(item) for item in value)
         return False
+
+    @staticmethod
+    def _receipt_from_decision(decision: dict) -> dict:
+        """Translate a redacted decision (GET /v1/proposals/<id>) into the same
+        receipt vocabulary the host uses at dispatch time (see api/bridge.py).
+
+        This is a read, not a write: it never triggers a PTY write and never
+        claims PROVIDER_COMPLETED. WRITE_FAILED is deliberately absent here -- a
+        pre-write failure leaves nothing in the journal, so from this read the
+        decision looks identical to "approved, not yet dispatched" (DISPATCHED).
+        That is fine: only the host UI retries, Hermes never should.
+        """
+        execution = decision.get("execution") or {}
+        exec_state = execution.get("state")
+        if exec_state == EXECUTION_SENT:
+            state = "HOST_WRITE_ACCEPTED"
+        elif exec_state == EXECUTION_UNKNOWN:
+            state = "PROVIDER_PROCESSING_UNKNOWN"
+        elif decision.get("status") == STATUS_APPROVED:
+            state = "DISPATCHED"
+        else:
+            state = "APPROVAL_REQUIRED"
+        return {
+            "decision_id": decision.get("decision_id"),
+            "request_id": execution.get("request_id"),
+            "state": state,
+            "retryable": False,
+        }
 
     @staticmethod
     def _strict_identifier_args(args: dict, expected: set[str], name: str) -> str:
@@ -275,21 +334,21 @@ class McpServer:
         return value
 
     @staticmethod
-    def _validate_execution_args(args: dict, name: str, extra: set[str]) -> None:
-        expected = {"decision_id", "proposal_hash", "request_id"} | extra
+    def _validate_automatic_args(args: dict, name: str, extra: set[str]) -> None:
+        """Strict args for automatic-action tools (currently only open_session).
+
+        No proposal_hash and no free-text field exist here — every field is a
+        safe identifier, so this is intentionally a tighter validator than the
+        loose free-text pattern a proposal payload allows.
+        """
+        expected = {"request_id"} | extra
         if set(args) != expected:
             raise McpProtocolError(f"{name} requires exactly: {', '.join(sorted(expected))}")
         for field in expected:
             value = args[field]
-            if not isinstance(value, str) or not value.strip() or len(value) > 12000:
+            if (not isinstance(value, str) or not value.strip() or len(value) > 128
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", value)):
                 raise McpProtocolError(f"{name}.{field} is invalid")
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", args["proposal_hash"]):
-            raise McpProtocolError(f"{name}.proposal_hash must be sha256")
-        for field in (expected - {"proposal_hash", "text"}):
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", args[field]):
-                raise McpProtocolError(f"{name}.{field} is invalid")
-        if "text" in extra and len(args["text"]) > 12000:
-            raise McpProtocolError(f"{name}.text exceeds 12000 characters")
 
     @staticmethod
     def _envelope(data: dict, source: str) -> dict:

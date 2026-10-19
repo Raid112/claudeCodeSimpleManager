@@ -166,6 +166,7 @@ def main():
             hermes_token=read_hermes_token(),
             operator_token=os.environ.get("CLAUDEMANAGER_OPERATOR_CAPABILITY"),
             groups=_load_config().get("groups", []),
+            auto_prompt_groups=_load_config().get("hermes_auto_prompt_groups", []),
         )
         agent_gateway.start()
         print(f"Agent gateway running on port {agent_gateway.actual_port}")

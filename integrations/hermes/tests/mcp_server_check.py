@@ -27,6 +27,9 @@ def test_tool_surface_is_narrow_and_protocol_errors_are_distinct():
     names = {tool["name"] for tool in server.tools()}
     assert "list_sessions" in names and "submit_proposal" in names
     assert "approve" not in names and "execute" not in names and "raw_websocket" not in names
+    # Task 2: dispatch is host-owned, so there is no tool that can trigger a
+    # PTY write -- only a read of the host's own dispatch receipt.
+    assert "send_prompt" not in names and "get_execution_receipt" in names
     result = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     assert "result" in result
     try:
@@ -89,17 +92,23 @@ def test_execution_tools_have_strict_contracts_and_call_semantic_routes():
     def request(method, path, payload=None):
         calls.append((method, path, payload))
         if path.startswith("/v1/proposals/"):
-            return 200, {"decision": {"decision_id": "d-1", "status": "approved"}}
+            return 200, {"decision": {"decision_id": "d-1", "status": "approved",
+                                       "execution": {"state": "SENT", "request_id": "r-2"}}}
         if path == "/v1/sessions":
             return 201, {"session": {"session_key": "new-session", "state": "DISPATCHED"}}
-        return 200, {"receipt": {"state": "SENT", "result": "host_write_accepted"}}
+        if path == "/v1/work-items/link":
+            return 201, {"link": {"session_key": payload["session_key"],
+                                   "work_item_id": payload["work_item_id"], "link_key": "csid-1"}}
+        return 200, {}
 
     server = McpServer("http://127.0.0.1:1", "token", attestation(), request_fn=request)
     tools = {tool["name"]: tool for tool in server.tools()}
+    assert "send_prompt" not in tools
     for name, fields in {
         "get_decision": {"decision_id"},
-        "open_session": {"decision_id", "proposal_hash", "request_id", "group_id"},
-        "send_prompt": {"decision_id", "proposal_hash", "request_id", "session_key", "text"},
+        "open_session": {"request_id", "group_id"},
+        "link_work_item": {"request_id", "session_key", "work_item_id"},
+        "get_execution_receipt": {"decision_id"},
     }.items():
         schema = tools[name]["inputSchema"]
         assert set(schema["required"]) == fields
@@ -110,27 +119,46 @@ def test_execution_tools_have_strict_contracts_and_call_semantic_routes():
                               "params": {"name": name, "arguments": arguments}})
 
     assert call("get_decision", {"decision_id": "d-1"})["result"]["isError"] is False
-    assert call("open_session", {"decision_id": "d-1", "proposal_hash": "a" * 64,
-                                  "request_id": "r-1", "group_id": "group-1"})["result"]["isError"] is False
-    assert call("send_prompt", {"decision_id": "d-1", "proposal_hash": "a" * 64,
-                                 "request_id": "r-2", "session_key": "session-1",
-                                 "text": "approved"})["result"]["isError"] is False
+    assert call("open_session", {"request_id": "r-1",
+                                  "group_id": "group-1"})["result"]["isError"] is False
+    link_call = call("link_work_item", {"request_id": "r-3", "session_key": "session-1",
+                                        "work_item_id": "wi_1"})
+    assert link_call["result"]["isError"] is False
+    assert link_call["result"]["structuredContent"] == {
+        "link": {"session_key": "session-1", "work_item_id": "wi_1", "link_key": "csid-1"}}
+    receipt_call = call("get_execution_receipt", {"decision_id": "d-1"})
+    assert receipt_call["result"]["isError"] is False
+    assert receipt_call["result"]["structuredContent"] == {
+        "decision_id": "d-1", "request_id": "r-2",
+        "state": "HOST_WRITE_ACCEPTED", "retryable": False,
+    }
     assert calls == [
         ("GET", "/v1/proposals/d-1", None),
-        ("POST", "/v1/sessions", {"decision_id": "d-1", "proposal_hash": "a" * 64,
-                                    "request_id": "r-1", "group_id": "group-1"}),
-        ("POST", "/v1/sessions/session-1/prompt", {"decision_id": "d-1",
-                                                     "proposal_hash": "a" * 64,
-                                                     "request_id": "r-2", "text": "approved"}),
+        ("POST", "/v1/sessions", {"request_id": "r-1", "group_id": "group-1"}),
+        ("POST", "/v1/work-items/link",
+         {"request_id": "r-3", "session_key": "session-1", "work_item_id": "wi_1"}),
+        ("GET", "/v1/proposals/d-1", None),
     ]
     try:
-        call("send_prompt", {"decision_id": "d-1", "proposal_hash": "a" * 64,
-                              "request_id": "r-3", "session_key": "session-1",
-                              "text": "ok", "extra": True})
+        call("link_work_item", {"request_id": "r-4", "session_key": "session-1",
+                                "work_item_id": "wi_1", "extra": True})
     except McpProtocolError:
         pass
     else:
-        raise AssertionError("execution tools must reject unknown arguments")
+        raise AssertionError("link_work_item must reject unknown arguments")
+    try:
+        call("get_execution_receipt", {"decision_id": "d-1", "extra": True})
+    except McpProtocolError:
+        pass
+    else:
+        raise AssertionError("get_execution_receipt must reject unknown arguments")
+    # open_session no longer accepts decision_id/proposal_hash: it isn't a proposal.
+    try:
+        call("open_session", {"request_id": "r-4", "group_id": "group-1", "decision_id": "d-1"})
+    except McpProtocolError:
+        pass
+    else:
+        raise AssertionError("open_session must reject decision_id/proposal_hash now")
 
 
 def test_execution_errors_and_unknown_receipts_are_visible_without_sensitive_fields():
@@ -139,20 +167,21 @@ def test_execution_errors_and_unknown_receipts_are_visible_without_sensitive_fie
 
     server = McpServer("http://127.0.0.1:1", "token", attestation(), request_fn=error_request)
     result = server.handle({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
-                            "params": {"name": "send_prompt", "arguments": {
-                                "decision_id": "d-1", "proposal_hash": "a" * 64,
-                                "request_id": "r-1", "session_key": "session-1", "text": "x"}}})
+                            "params": {"name": "get_execution_receipt",
+                                       "arguments": {"decision_id": "d-1"}}})
     assert result["result"]["isError"] is True
     encoded = json.dumps(result)
     assert "secret" not in encoded and "C:\\private" not in encoded
 
     server = McpServer("http://127.0.0.1:1", "token", attestation(),
-                       request_fn=lambda *args: (200, {"receipt": {"state": "UNKNOWN"}}))
+                       request_fn=lambda *args: (200, {"decision": {
+                           "decision_id": "d-1", "status": "unknown",
+                           "execution": {"state": "UNKNOWN", "request_id": "r-1"}}}))
     result = server.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
-                            "params": {"name": "send_prompt", "arguments": {
-                                "decision_id": "d-1", "proposal_hash": "a" * 64,
-                                "request_id": "r-1", "session_key": "session-1", "text": "x"}}})
+                            "params": {"name": "get_execution_receipt",
+                                       "arguments": {"decision_id": "d-1"}}})
     assert result["result"]["isError"] is True
+    assert result["result"]["structuredContent"]["state"] == "PROVIDER_PROCESSING_UNKNOWN"
 
 
 def test_adapter_runs_as_documented_direct_script():

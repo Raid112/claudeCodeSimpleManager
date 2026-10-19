@@ -11,13 +11,19 @@ from terminal.agent_contracts import (
     ACTION_OPEN_SESSION,
     ACTION_SEND_PROMPT,
     ACTION_LINK_WORK_ITEM,
+    ACTION_POLICY,
+    ALLOWED_ACTIONS,
     EXECUTION_ACCEPTED,
     EXECUTION_UNKNOWN,
     MODEL_NAME,
     MODEL_PROVIDER,
+    POLICY_APPROVAL_REQUIRED,
+    POLICY_AUTOMATIC,
+    POLICY_DENY_ALWAYS,
     STATUS_AWAITING_APPROVAL,
     STATUS_PROPOSED,
     STATUS_REJECTED,
+    action_policy,
     can_transition,
     proposal_hash,
     validate_feedback,
@@ -53,12 +59,12 @@ def valid_proposal():
             "content_hash": "b" * 64,
             "trust": "external_data",
         }],
-        "intent": "Open the selected project session",
+        "intent": "Send the approved prompt to the selected session",
         "action": {
-            "type": ACTION_OPEN_SESSION,
-            "target": {"group_id": "group-1"},
-            "parameters": {},
-            "expected_outcome": "A managed session is available",
+            "type": ACTION_SEND_PROMPT,
+            "target": {"session_key": "session-1"},
+            "parameters": {"text": "Faça um discovery read-only sobre este problema."},
+            "expected_outcome": "The exact approved prompt reaches the session",
             "reversible": True,
         },
         "risk": {"level": "low", "factors": []},
@@ -120,6 +126,52 @@ def test_deny_always_and_unknown_actions_never_validate():
         ok, errors = validate_proposal(proposal)
         assert not ok, action_type
         assert any("action" in error for error in errors)
+
+
+def test_open_session_and_link_work_item_are_no_longer_proposable():
+    # Both moved to the automatic policy (Task 1): a proposal carrying either
+    # action type must be rejected the same way any other out-of-allowlist type is.
+    proposal = valid_proposal()
+    proposal["action"] = {
+        "type": ACTION_OPEN_SESSION,
+        "target": {"group_id": "group-1"},
+        "parameters": {},
+        "expected_outcome": "A managed session is available",
+        "reversible": True,
+    }
+    proposal["proposal_hash"] = proposal_hash(proposal)
+    ok, errors = validate_proposal(proposal)
+    assert not ok and any("action" in error for error in errors)
+
+    proposal = valid_proposal()
+    proposal["action"] = {
+        "type": ACTION_LINK_WORK_ITEM,
+        "target": {"session_key": "session-1"},
+        "parameters": {"work_item_id": "wi_1"},
+        "expected_outcome": "The session is linked to the work item",
+        "reversible": True,
+    }
+    proposal["proposal_hash"] = proposal_hash(proposal)
+    ok, errors = validate_proposal(proposal)
+    assert not ok and any("action" in error for error in errors)
+
+
+def test_send_prompt_proposals_still_validate_and_require_approval():
+    proposal = valid_proposal()
+    ok, errors = validate_proposal(proposal)
+    assert ok, errors
+    assert proposal["action"]["type"] == ACTION_SEND_PROMPT
+    assert proposal["policy"]["decision"] == "approval_required"
+
+
+def test_action_policy_table_is_the_single_source_of_truth():
+    assert ALLOWED_ACTIONS == frozenset({ACTION_SEND_PROMPT})
+    assert action_policy(ACTION_OPEN_SESSION) == POLICY_AUTOMATIC
+    assert action_policy(ACTION_LINK_WORK_ITEM) == POLICY_AUTOMATIC
+    assert action_policy(ACTION_SEND_PROMPT) == POLICY_APPROVAL_REQUIRED
+    assert action_policy("shell") == POLICY_DENY_ALWAYS
+    assert action_policy("unknown-future-action") == POLICY_DENY_ALWAYS
+    assert set(ACTION_POLICY) == {ACTION_OPEN_SESSION, ACTION_LINK_WORK_ITEM, ACTION_SEND_PROMPT}
 
 
 def test_model_attestation_must_be_verified_luna():

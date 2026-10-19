@@ -7,24 +7,38 @@ browser WebSocket, PTY handle, filesystem path, or credential to Hermes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import secrets
 import threading
+import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from terminal.agent_contracts import ACTION_OPEN_SESSION, ACTION_SEND_PROMPT, STATUS_APPROVED, STATUS_EXPIRED
-from terminal.agent_decisions import AuthorizationError, ConflictError
-from terminal import agent_decisions
+from terminal.agent_contracts import (
+    ACTION_LINK_WORK_ITEM, ACTION_OPEN_SESSION, ACTION_SEND_OWNED_PROMPT,
+)
 from terminal.input_protocol import InputProtocolError
+from terminal.agent_decisions import AuthorizationError, ConflictError
+from terminal import agent_decisions, hermes_events
 from terminal.agent_sources import SourcePoller
+from terminal.work_items import resolve_work_item_id
 
 
 class GatewayAuthError(RuntimeError):
     pass
+
+
+# GET /v1/events (see AgentGateway._handle_events).
+EVENTS_DEFAULT_WINDOW_S = 900.0  # missing `since` -> a bounded recent catch-up window,
+                                  # not an unbounded replay (work_items.read_events
+                                  # tolerates since=None but would then walk up to 60
+                                  # days of retained partitions on every call).
+EVENTS_MAX_RECORDS = 500  # keeps the response well under max_response_bytes (512KB);
+                           # the live log already holds 41k+ raw hook records.
 
 
 class AgentGateway:
@@ -32,6 +46,7 @@ class AgentGateway:
                  host: str = "127.0.0.1", port: int = 8787,
                  hermes_token: str | None = None, operator_token: str | None = None,
                  groups: list[dict] | None = None,
+                 auto_prompt_groups: list[str] | None = None,
                  max_body_bytes: int = 64 * 1024, max_query_chars: int = 256,
                  max_response_bytes: int = 512 * 1024, max_connections: int = 16):
         if host != "127.0.0.1":
@@ -57,6 +72,12 @@ class AgentGateway:
             for item in (groups or [])
             if isinstance(item, dict) and (item.get("group_id") or item.get("name"))
         }
+        # Groups whose Hermes-opened tabs accept prompts with no approval. Empty by
+        # default: the lane stays closed until config.json names a group.
+        self.auto_prompt_groups = {
+            str(name) for name in (auto_prompt_groups or [])
+            if str(name) in self.configured_groups
+        }
         self.host = host
         self.port = int(port)
         self.max_body_bytes = max(1024, int(max_body_bytes))
@@ -71,7 +92,10 @@ class AgentGateway:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._emergency_stopped = False
-        self._execution_locks: dict[str, threading.RLock] = {}
+        # request_id -> {"lock": RLock, "refcount": int}. Refcounted so eviction
+        # (see _execution_lock) can never remove an entry a thread is still
+        # inside, while still not growing forever like the plain dict it replaced.
+        self._execution_locks: dict[str, dict] = {}
         self._execution_locks_guard = threading.Lock()
         self.source_poller = SourcePoller()
 
@@ -198,13 +222,16 @@ class AgentGateway:
                 return
             prompt_session_key = self._prompt_session_key(path.path)
             if prompt_session_key is not None and method == "POST":
+                # Approval-free lane for the remote case (nobody at the PC): only a
+                # tab Hermes opened itself, only in an allow-listed group. Every
+                # other prompt still goes host-owned through proposal + approval.
                 if not is_hermes:
                     self._send(handler, 403, {"error": "hermes_read_token_required"})
                     return
                 if self.emergency_stopped:
                     self._send(handler, 503, {"error": "emergency_stop_active"})
                     return
-                self._handle_prompt(handler, prompt_session_key)
+                self._handle_owned_prompt(handler, prompt_session_key)
                 return
             if path.path == "/v1/sessions" and method == "POST":
                 if not is_hermes:
@@ -214,6 +241,15 @@ class AgentGateway:
                     self._send(handler, 503, {"error": "emergency_stop_active"})
                     return
                 self._handle_session_create(handler)
+                return
+            if path.path == "/v1/work-items/link" and method == "POST":
+                if not is_hermes:
+                    self._send(handler, 403, {"error": "hermes_read_token_required"})
+                    return
+                if self.emergency_stopped:
+                    self._send(handler, 503, {"error": "emergency_stop_active"})
+                    return
+                self._handle_link_work_item(handler)
                 return
             if path.path == "/v1/proposals" and method == "POST":
                 if not is_hermes:
@@ -270,79 +306,35 @@ class AgentGateway:
         key = path[len(prefix):-len(suffix)]
         return key or None
 
-    def _execution_lock(self, decision_id: str) -> threading.RLock:
+    @contextlib.contextmanager
+    def _execution_lock(self, request_id: str):
+        """Serialize concurrent requests sharing one request_id, without leaking
+        one RLock per distinct request_id forever (the previous behaviour).
+
+        The dict entry is refcounted under _execution_locks_guard: a thread
+        registers its use (increments refcount) *before* it can block on the
+        actual RLock, and only decrements/evicts after it is fully done with the
+        entry (lock released). That refcount -- not whether the RLock happens to
+        be acquired at this instant -- is what "held" means here, so an entry can
+        never be evicted out from under a thread still using it, and a
+        request_id reused later (e.g. a dispatch retry's deterministic id) just
+        creates a fresh entry.  Call sites are unchanged: still `with
+        self._execution_lock(request_id):`.
+        """
         with self._execution_locks_guard:
-            return self._execution_locks.setdefault(decision_id, threading.RLock())
-
-    @staticmethod
-    def _validate_prompt_decision(decision_id: str, proposal_hash: str,
-                                  session_key: str, text: str) -> dict:
-        decision = agent_decisions.get_decision(decision_id)
-        if decision is None:
-            raise KeyError(decision_id)
-        if decision["proposal_hash"] != proposal_hash:
-            raise ConflictError("proposal hash does not match")
-        action = decision["proposal"].get("action") or {}
-        target = action.get("target") or {}
-        parameters = action.get("parameters") or {}
-        if action.get("type") != ACTION_SEND_PROMPT:
-            raise ConflictError("proposal action type does not match send_prompt")
-        if target.get("session_key") != session_key:
-            raise ConflictError("proposal target does not match session_key")
-        if parameters.get("text") != text:
-            raise ConflictError("prompt does not match approved proposal")
-        if decision["status"] == STATUS_EXPIRED:
-            raise ConflictError("proposal_expired")
-        if decision["status"] != STATUS_APPROVED:
-            raise PermissionError("approved execution required")
-        return decision
-
-    def _handle_prompt(self, handler: BaseHTTPRequestHandler, session_key: str) -> None:
+            entry = self._execution_locks.get(request_id)
+            if entry is None:
+                entry = {"lock": threading.RLock(), "refcount": 0}
+                self._execution_locks[request_id] = entry
+            entry["refcount"] += 1
         try:
-            length = int(handler.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send(handler, 400, {"error": "invalid_content_length"})
-            return
-        if length <= 0 or length > self.max_body_bytes:
-            self._send(handler, 413, {"error": "body_limit"})
-            return
-        try:
-            raw = handler.rfile.read(length)
-            payload = json.loads(raw.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            self._send(handler, 400, {"error": "invalid_json"})
-            return
-        if not isinstance(payload, dict):
-            self._send(handler, 400, {"error": "body_must_be_object"})
-            return
-        required = {"decision_id", "proposal_hash", "request_id", "text"}
-        if set(payload) != required or not all(isinstance(payload[key], str) for key in required):
-            self._send(handler, 400, {"error": "prompt_contract"})
-            return
-        if not payload["text"] or not payload["request_id"]:
-            self._send(handler, 400, {"error": "prompt_empty"})
-            return
-        try:
-            self._validate_prompt_decision(
-                payload["decision_id"], payload["proposal_hash"], session_key, payload["text"])
-            receipt = self.pty_manager.send_prompt(
-                session_key, payload["text"], payload["request_id"],
-                payload["decision_id"], payload["proposal_hash"])
-            self._send(handler, 200, {"receipt": receipt})
-        except KeyError:
-            self._send(handler, 404, {"error": "session_or_decision_not_found"})
-        except PermissionError:
-            self._send(handler, 403, {"error": "approved_execution_required"})
-        except AuthorizationError as exc:
-            self._send(handler, 403, {"error": str(exc)})
-        except InputProtocolError as exc:
-            self._send(handler, 400, {"error": str(exc)})
-        except ConflictError as exc:
-            self._send(handler, 409, {"error": str(exc)})
-        except ValueError as exc:
-            self._send(handler, 409, {"error": str(exc)})
-        except Exception:
-            self._send(handler, 503, {"error": "prompt_execution_unavailable"})
+            with entry["lock"]:
+                yield
+        finally:
+            with self._execution_locks_guard:
+                entry["refcount"] -= 1
+                if entry["refcount"] == 0 and self._execution_locks.get(request_id) is entry:
+                    del self._execution_locks[request_id]
 
     @staticmethod
     def _safe_configured_path(raw_path: str) -> Path:
@@ -369,10 +361,17 @@ class AgentGateway:
             raise ValueError("configured group path cannot be verified") from exc
 
     def _handle_session_create(self, handler: BaseHTTPRequestHandler) -> None:
+        """`open_session` is automatic: no proposal, no approval, no decision at all.
+
+        Only the configured-group check and the emergency stop still gate it. The
+        action is journaled via ``record_automatic_action`` (audit, not authorization)
+        and made idempotent per ``request_id`` so a replay or a concurrent duplicate
+        never opens a second tab.
+        """
         payload = self._read_json_body(handler)
         if payload is None:
             return
-        required = {"decision_id", "proposal_hash", "request_id", "group_id"}
+        required = {"request_id", "group_id"}
         if set(payload) != required or not all(isinstance(payload[key], str) for key in required):
             self._send(handler, 400, {"error": "session_creation_contract"})
             return
@@ -386,35 +385,21 @@ class AgentGateway:
             self._send(handler, 403, {"error": "group_id_not_configured"})
             return
         try:
-            with self._execution_lock(payload["decision_id"]):
+            # Keyed by request_id (not decision_id — there is no decision), so two
+            # concurrent identical requests serialize here before either touches
+            # the PTY manager or the journal.
+            with self._execution_lock(payload["request_id"]):
+                existing = agent_decisions.find_automatic_action(payload["request_id"])
+                if existing is not None:
+                    # find_automatic_action matches on request_id alone (Task 4 adds a
+                    # second automatic route, link_work_item, sharing the same journal
+                    # helper) — guard against a reused request_id replaying the wrong
+                    # action's result instead of this route's own.
+                    if existing.get("action_type") != ACTION_OPEN_SESSION:
+                        raise ConflictError("request_id is already bound to a different automatic action")
+                    self._send(handler, 201, {"session": existing.get("result")})
+                    return
                 root = self._safe_configured_path(group["path"])
-                decision = agent_decisions.get_decision(payload["decision_id"])
-                if decision is None:
-                    raise PermissionError("approved session proposal required")
-                if decision["proposal_hash"] != payload["proposal_hash"]:
-                    raise ConflictError("proposal hash does not match")
-                if decision["status"] == STATUS_EXPIRED:
-                    raise ConflictError("proposal_expired")
-                action = decision["proposal"].get("action") or {}
-                if action.get("type") != ACTION_OPEN_SESSION:
-                    raise ConflictError("proposal action type does not match open_session")
-                if (action.get("target") or {}).get("group_id") != group_id:
-                    raise ConflictError("proposal target does not match group_id")
-                existing = decision.get("execution") or {}
-                if existing.get("request_id") == payload["request_id"]:
-                    if existing.get("state") == "DISPATCHED":
-                        self._send(handler, 201, {"session": existing.get("result") or existing})
-                        return
-                    if existing.get("state") == "ACCEPTED":
-                        agent_decisions.append_execution_result(payload["decision_id"], {
-                            "request_id": payload["request_id"], "state": "UNKNOWN",
-                            "reason": "session creation outcome is unknown after accepted dispatch",
-                        })
-                        self._send(handler, 503, {"error": "session_creation_unknown"})
-                        return
-                if decision["status"] != STATUS_APPROVED:
-                    raise PermissionError("approved session proposal required")
-                agent_decisions.execute_approved(payload["decision_id"], payload["proposal_hash"], payload["request_id"])
                 session = self.pty_manager.create_session(
                     group["name"], str(root), terminal_type="claude")
                 public = {
@@ -424,22 +409,187 @@ class AgentGateway:
                     "terminal_type": "claude",
                     "state": "DISPATCHED",
                 }
-                agent_decisions.append_execution_result(payload["decision_id"], {
-                    "request_id": payload["request_id"], "state": "DISPATCHED", "result": public,
-                })
+                # The tab exists before the journal write can name its session_key, so
+                # a failed write (emergency stop flipped, audit storage error) would
+                # leave an unjournaled tab AND let a replay open a second one. Undo the
+                # creation instead: either the action is recorded or it did not happen.
+                try:
+                    agent_decisions.record_automatic_action(
+                        ACTION_OPEN_SESSION, payload["request_id"], public)
+                except Exception:
+                    try:
+                        self.pty_manager.close_session(session.id)
+                    except Exception:
+                        pass
+                    raise
                 self._send(handler, 201, {"session": public})
-        except KeyError:
-            self._send(handler, 404, {"error": "decision_not_found"})
-        except PermissionError as exc:
-            self._send(handler, 403, {"error": str(exc)})
-        except AuthorizationError as exc:
-            self._send(handler, 403, {"error": str(exc)})
+        except AuthorizationError:
+            # Emergency stop flipped between the route-level check and this write.
+            self._send(handler, 503, {"error": "emergency_stop_active"})
         except ConflictError as exc:
             self._send(handler, 409, {"error": str(exc)})
         except ValueError as exc:
             self._send(handler, 400, {"error": str(exc)})
         except Exception:
             self._send(handler, 503, {"error": "session_creation_unavailable"})
+
+    def _handle_owned_prompt(self, handler: BaseHTTPRequestHandler, session_key: str) -> None:
+        """``send_owned_prompt`` is automatic, scoped by ownership instead of approval.
+
+        Gates, in order: identifier shape, the tab exists, Hermes opened it (journal
+        has its ``open_session``), its group is in ``auto_prompt_groups``. Idempotent
+        per ``request_id`` like the other automatic routes. The journal write runs
+        after the PTY write, so a journal failure is reported as 503 with
+        ``written: true`` and the caller must not retry with a new request_id.
+        """
+        payload = self._read_json_body(handler)
+        if payload is None:
+            return
+        required = {"request_id", "text"}
+        if set(payload) != required or not all(isinstance(payload[key], str) for key in required):
+            self._send(handler, 400, {"error": "owned_prompt_contract"})
+            return
+        request_id, text = payload["request_id"], payload["text"]
+        identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+        if not identifier.fullmatch(request_id) or not identifier.fullmatch(session_key):
+            self._send(handler, 400, {"error": "invalid_identifier"})
+            return
+        if not text.strip():
+            self._send(handler, 400, {"error": "empty_prompt"})
+            return
+        try:
+            with self._execution_lock(request_id):
+                existing = agent_decisions.find_automatic_action(request_id)
+                if existing is not None:
+                    if existing.get("action_type") != ACTION_SEND_OWNED_PROMPT:
+                        raise ConflictError("request_id is already bound to a different automatic action")
+                    self._send(handler, 201, {"prompt": existing.get("result")})
+                    return
+                session = self.pty_manager.find_by_session_key(session_key)
+                if session is None:
+                    self._send(handler, 404, {"error": "session_not_found"})
+                    return
+                if getattr(session, "group_name", None) not in self.auto_prompt_groups:
+                    self._send(handler, 403, {"error": "group_not_enabled_for_auto_prompt"})
+                    return
+                if not agent_decisions.hermes_opened_session(session_key):
+                    self._send(handler, 403, {"error": "session_not_opened_by_hermes"})
+                    return
+                try:
+                    written = self.pty_manager.send_owned_prompt(session_key, text)
+                except InputProtocolError as exc:
+                    self._send(handler, 400, {"error": f"input_protocol: {exc}"})
+                    return
+                public = {
+                    "session_key": session_key,
+                    "state": "SENT" if written else "UNKNOWN",
+                    "provider_processed": False,
+                    "prompt_length": len(text),
+                }
+                try:
+                    agent_decisions.record_automatic_action(
+                        ACTION_SEND_OWNED_PROMPT, request_id, public)
+                except Exception:
+                    self._send(handler, 503, {"error": "prompt_journal_unavailable", "written": written})
+                    return
+                self._send(handler, 201 if written else 502, {"prompt": public})
+        except ConflictError as exc:
+            self._send(handler, 409, {"error": str(exc)})
+        except PermissionError as exc:
+            self._send(handler, 403, {"error": str(exc)})
+        except Exception:
+            self._send(handler, 503, {"error": "owned_prompt_unavailable"})
+
+    def _handle_link_work_item(self, handler: BaseHTTPRequestHandler) -> None:
+        """``link_work_item`` is automatic: no proposal, no approval.
+
+        Order matters and deliberately differs from ``_handle_session_create``:
+        here ``work_items.link`` runs BEFORE the journal write, not after. That
+        route creates a scarce resource (a PTY tab) it must undo if the journal
+        write fails, or a retry opens a second one. ``work_items.link`` is
+        idempotent -- relinking the same session to the same Work Item just
+        bumps ``ts`` -- so a retry after a journal failure repeats a harmless
+        write instead of needing an undo.
+        """
+        payload = self._read_json_body(handler)
+        if payload is None:
+            return
+        required = {"request_id", "session_key", "work_item_id"}
+        if set(payload) != required or not all(isinstance(payload[key], str) for key in required):
+            self._send(handler, 400, {"error": "link_work_item_contract"})
+            return
+        request_id = payload["request_id"]
+        session_key = payload["session_key"]
+        work_item_id = payload["work_item_id"]
+        identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+        if not all(identifier.fullmatch(value) for value in (request_id, session_key, work_item_id)):
+            self._send(handler, 400, {"error": "invalid_identifier"})
+            return
+        try:
+            with self._execution_lock(request_id):
+                existing = agent_decisions.find_automatic_action(request_id)
+                if existing is not None:
+                    if existing.get("action_type") != ACTION_LINK_WORK_ITEM:
+                        raise ConflictError("request_id is already bound to a different automatic action")
+                    self._send(handler, 201, {"link": existing.get("result")})
+                    return
+                session = self.pty_manager.find_by_session_key(session_key)
+                if session is None:
+                    self._send(handler, 404, {"error": "session_not_found"})
+                    return
+                try:
+                    store = self.work_item_store.load_store()
+                except Exception:
+                    self._send(handler, 503, {"error": "work_items_unavailable"})
+                    return
+                items = store.get("items", []) if isinstance(store, dict) else []
+                if not any(isinstance(item, dict) and item.get("id") == work_item_id for item in items):
+                    self._send(handler, 404, {"error": "work_item_not_found"})
+                    return
+                # Mirrors app.js sessionLinkKeyOf exactly: a claude tab's durable
+                # work-item key is its claude_session_id (falling back to
+                # session_key only if the provider id isn't known yet); other
+                # providers key by session_key itself. Writing under the wrong
+                # key would create a second link the frontend never reads.
+                terminal_type = getattr(session, "terminal_type", None)
+                if terminal_type == "powershell":
+                    link_key = None
+                elif terminal_type == "claude":
+                    link_key = getattr(session, "claude_session_id", None) or session_key
+                else:
+                    link_key = (session_key or getattr(session, "agent_session_id", None)
+                                or getattr(session, "claude_session_id", None))
+                if not link_key:
+                    self._send(handler, 400, {"error": "session_not_linkable"})
+                    return
+                public = {"session_key": session_key, "work_item_id": work_item_id, "link_key": link_key}
+                try:
+                    self.work_item_store.link(
+                        link_key, work_item_id,
+                        group_name=getattr(session, "group_name", None),
+                        path=getattr(session, "path", None))
+                except Exception:
+                    self._send(handler, 503, {"error": "link_unavailable"})
+                    return
+                try:
+                    agent_decisions.record_automatic_action(ACTION_LINK_WORK_ITEM, request_id, public)
+                except AuthorizationError:
+                    # Emergency stop flipped between the route-level check and this
+                    # write. The link above already happened; unlinking it back out
+                    # risks clobbering a pre-existing, unrelated link for the same
+                    # key (work_items.unlink removes the whole entry, it does not
+                    # restore a prior value) -- narrower and safer to leave the link
+                    # in place and simply not journal it than to "undo" it.
+                    self._send(handler, 503, {"error": "emergency_stop_active"})
+                    return
+                except Exception:
+                    self._send(handler, 503, {"error": "link_persistence_unavailable"})
+                    return
+                self._send(handler, 201, {"link": public})
+        except ConflictError as exc:
+            self._send(handler, 409, {"error": str(exc)})
+        except Exception:
+            self._send(handler, 503, {"error": "link_unavailable"})
 
     @staticmethod
     def _bearer(handler: BaseHTTPRequestHandler) -> str | None:
@@ -456,10 +606,13 @@ class AgentGateway:
                 "version": "v1",
                 "status": "stopped" if self.emergency_stopped else "running",
                 "model_requirement": "gpt-5.6-luna",
-                "read_only": True,
+                "read_only": not self.auto_prompt_groups,
+                "auto_prompt_groups": sorted(self.auto_prompt_groups),
             }
         if path == "/v1/sessions":
             return 200, {"sessions": self._sessions()}
+        if path == "/v1/events":
+            return self._handle_events(query)
         prefix = "/v1/proposals/"
         if path.startswith(prefix):
             decision_id = path[len(prefix):]
@@ -560,6 +713,114 @@ class AgentGateway:
             "attempt": decision.get("attempt", 0),
             "status": decision.get("status"),
         }})
+
+    def _handle_events(self, query: dict[str, list[str]]) -> tuple[int, dict]:
+        """``GET /v1/events?since=<unix ts>`` -- the reconciliation view of what
+        the webhook publisher (``terminal/hermes_events.HermesEventsPublisher``)
+        would have sent. Not a second event queue: reads the same append-only
+        hook-event log via ``work_items.read_events`` and runs every record
+        through ``hermes_events.normalize_event``, the identical pure mapping
+        the publisher uses, so the two paths can never disagree on what counts
+        as a wake-up.
+
+        Only the three publishable types are returned (``normalize_event``
+        returning ``None`` means logged-only -- already on disk via
+        ``work_items``, nothing to reconcile). Mixing that raw hook noise into
+        this response would make a future reconciliation job double-count
+        events the publisher never would have sent in the first place.
+
+        Not gated by the emergency stop: every other GET route
+        (``/v1/sessions``, ``/v1/work-items``, ``/v1/work-overview``, ...)
+        stays readable while stopped too. The stop is a kill-switch for
+        autonomous WRITES (``/v1/sessions`` POST, ``/v1/work-items/link``
+        POST, and the always-403 prompt route), not for reading already-logged,
+        side-effect-free metadata.
+
+        ``since`` is a float unix timestamp, matching ``work_items.read_events``.
+        A missing ``since`` defaults to ``EVENTS_DEFAULT_WINDOW_S`` seconds
+        before now rather than an unbounded replay. A malformed ``since`` is a
+        400, not a silent fallback.
+
+        The response is capped at ``EVENTS_MAX_RECORDS`` publishable events
+        (well under ``max_response_bytes`` -- the live log already holds 41k+
+        raw records) and always carries ``next_since`` plus ``truncated`` so a
+        caller pages instead of assuming one call drains the log. When a page
+        is NOT truncated, ``next_since`` is the query time captured before the
+        read (or the newest record actually scanned, if that is later) --
+        never just the last event returned -- so a window with zero
+        publishable events (e.g. only PreToolUse/PostToolUse activity) still
+        advances instead of being re-read forever. A truncated page instead
+        anchors ``next_since`` to its last returned event's timestamp so the
+        caller resumes exactly where the cap cut off; per work_items' own
+        cursor-resume note, several records can share one float `ts`, so a
+        caller must dedup by `event_id` across pages -- the same guarantee the
+        publisher's cursor already relies on.
+        """
+        raw_since = (query.get("since") or [None])[0]
+        query_ts = time.time()
+        if raw_since is None:
+            since = query_ts - EVENTS_DEFAULT_WINDOW_S
+        else:
+            try:
+                since = float(raw_since)
+            except (TypeError, ValueError):
+                return 400, {"error": "invalid_since"}
+            if since != since or since in (float("inf"), float("-inf")) or since < 0:
+                return 400, {"error": "invalid_since"}
+
+        # Widen the read slightly for disambiguation context only (mirrors the
+        # publisher's own OVERLAP_WINDOW_S use): a Notification landing right at
+        # the `since` boundary needs its preceding same-session raw event to
+        # tell permission_requested apart from a logged-only status_changed.
+        # Never surfaced itself -- filtered back out by the `ts < since` check.
+        lookback = max(0.0, since - hermes_events.OVERLAP_WINDOW_S)
+        try:
+            records = self.work_item_store.read_events(since=lookback)
+        except Exception:
+            return 503, {"error": "events_unavailable"}
+        try:
+            session_links = self.work_item_store.load_store().get("session_links", {})
+        except Exception:
+            session_links = {}
+
+        prev_event_by_session: dict[str, str] = {}
+        scanned_max_ts = since
+        normalized_events: list[tuple[float, dict]] = []
+        for rec in records:  # work_items.read_events returns ts-ascending
+            ts = rec.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            session_key = rec.get("session_key")
+            prev_event = prev_event_by_session.get(session_key) if session_key else None
+            try:
+                normalized = hermes_events.normalize_event(rec, prev_event)
+            except Exception:
+                normalized = None
+            # Update ordering context for every in-window-or-lookback record,
+            # even one that turns out logged-only, or the next record for this
+            # session would be disambiguated against a stale prev_event.
+            if session_key:
+                prev_event_by_session[session_key] = rec.get("event")
+            if ts < since:
+                continue  # context-only: seeded prev_event above, never surfaced
+            if ts > scanned_max_ts:
+                scanned_max_ts = ts
+            if normalized is None:
+                continue
+            normalized["work_item_id"] = resolve_work_item_id(
+                session_links, session_key, rec.get("claude_session_id"))
+            normalized_events.append((float(ts), normalized))
+
+        normalized_events.sort(key=lambda pair: pair[0])
+        truncated = len(normalized_events) > EVENTS_MAX_RECORDS
+        page = normalized_events[:EVENTS_MAX_RECORDS]
+        next_since = page[-1][0] if truncated else max(scanned_max_ts, query_ts)
+        return 200, {
+            "events": [item for _, item in page],
+            "next_since": next_since,
+            "truncated": truncated,
+            "cap": EVENTS_MAX_RECORDS,
+        }
 
     def _sessions(self) -> list[dict]:
         try:

@@ -31,11 +31,12 @@ class Pty:
 
 
 class CreatePty(Pty):
-    def __init__(self): self.created = []
+    def __init__(self): self.created = []; self.closed = []
     def create_session(self, group_name, path, terminal_type="claude"):
         session = type("Session", (), {"session_key": "created-session", "id": "private-id"})()
         self.created.append((group_name, path, terminal_type))
         return session
+    def close_session(self, session_id): self.closed.append(session_id)
 
 
 class ConcurrentCreatePty(CreatePty):
@@ -130,8 +131,12 @@ class Source:
 def iso(offset=0): return (datetime.now(timezone.utc) + timedelta(seconds=offset)).isoformat()
 
 
-def make_proposal(action_type="open_session", version=1, parent=None, idem=None, text=None,
+def make_proposal(action_type="send_prompt", version=1, parent=None, idem=None, text=None,
                   expires_in=300):
+    # send_prompt is the only proposable action type now (Task 1); open_session
+    # stays selectable here only for the tests proving it is rejected.
+    if action_type == "send_prompt" and text is None:
+        text = "Approved default prompt"
     action = {
         "type": action_type,
         "target": {"group_id": "group-1"} if action_type == "open_session" else {"session_key": "session-1"},
@@ -242,7 +247,10 @@ def test_expiry_high_risk_emergency_stop_and_capability_replay():
         temp.cleanup()
 
 
-def test_approved_session_creation_uses_only_configured_group_and_is_idempotent():
+def test_open_session_is_automatic_and_idempotent_with_no_decision():
+    # open_session no longer goes through a proposal or approval at all: the
+    # contract is exactly {request_id, group_id}, and a replay of the same
+    # request_id must return the identical response instead of a second tab.
     temp, gateway = setup_gateway()
     root = tempfile.TemporaryDirectory()
     manager = CreatePty()
@@ -252,47 +260,178 @@ def test_approved_session_creation_uses_only_configured_group_and_is_idempotent(
                            groups=[{"group_id": "group-1", "name": "Project", "path": root.name}])
     gateway.start()
     try:
-        proposal = make_proposal()
-        status, _ = request(gateway, "POST", "/v1/proposals", HERMES, proposal)
-        assert status == 201
-        agent_decisions.approve(proposal["decision_id"], proposal["proposal_hash"], "user", "cap-session")
-        body = {"decision_id": proposal["decision_id"], "proposal_hash": proposal["proposal_hash"],
-                "request_id": "create-1", "group_id": "group-1"}
-        first_status, _ = request(gateway, "POST", "/v1/sessions", HERMES, body)
+        body = {"request_id": "create-1", "group_id": "group-1"}
+        first_status, first_body = request(gateway, "POST", "/v1/sessions", HERMES, body)
         assert first_status == 201
-        assert request(gateway, "POST", "/v1/sessions", HERMES, body)[0] == 201
+        assert first_body["session"]["session_key"] == "created-session"
+
+        second_status, second_body = request(gateway, "POST", "/v1/sessions", HERMES, body)
+        assert second_status == 201
+        assert second_body == first_body
         assert len(manager.created) == 1
+
+        # Still journaled even without a proposal/approval, and the chain stays valid.
+        recorded = agent_decisions.find_automatic_action("create-1")
+        assert recorded["result"] == first_body["session"]
+        assert agent_decisions.verify_audit_chain()
+
         assert request(gateway, "POST", "/v1/sessions", HERMES,
-                       {**body, "group_id": "C:\\arbitrary"})[0] == 400
+                       {"request_id": "create-2", "group_id": "group-not-configured"})[0] == 403
+        assert request(gateway, "POST", "/v1/sessions", HERMES,
+                       {"request_id": "create-3", "group_id": "C:\\arbitrary"})[0] == 400
+        # The old {decision_id, proposal_hash, ...} body no longer matches the contract.
+        assert request(gateway, "POST", "/v1/sessions", HERMES,
+                       {**body, "request_id": "create-4", "decision_id": "d-1"})[0] == 400
     finally:
         gateway.stop()
         root.cleanup()
         temp.cleanup()
 
 
-def test_prompt_requires_exact_approved_action_target_and_payload():
+def test_open_session_rejects_request_id_reused_by_a_different_automatic_action():
+    # find_automatic_action matches on request_id alone; if a future automatic
+    # route (e.g. link_work_item, Task 4) reuses the same helper, a request_id
+    # collision must not replay the wrong action's result.
     temp, gateway = setup_gateway()
-    manager, session = prompt_manager()
+    root = tempfile.TemporaryDirectory()
+    manager = CreatePty()
     gateway.stop()
     gateway = AgentGateway(manager, Store(), Source(), Source(), port=0,
-                           hermes_token=HERMES, operator_token=OPERATOR)
+                           hermes_token=HERMES, operator_token=OPERATOR,
+                           groups=[{"group_id": "group-1", "name": "Project", "path": root.name}])
     gateway.start()
     try:
-        proposal = make_proposal(action_type="send_prompt", text="approved text")
-        assert request(gateway, "POST", "/v1/proposals", HERMES, proposal)[0] == 201
-        agent_decisions.approve(proposal["decision_id"], proposal["proposal_hash"], "user", "cap-prompt")
-        body = {"decision_id": proposal["decision_id"], "proposal_hash": proposal["proposal_hash"],
-                "request_id": "prompt-1", "text": "approved text"}
-        assert request(gateway, "POST", "/v1/sessions/session-1/prompt", HERMES, body)[0] == 200
-        assert session.writes
+        agent_decisions.record_automatic_action(
+            "link_work_item", "shared-request-id", {"linked": True})
+        status, body = request(gateway, "POST", "/v1/sessions", HERMES,
+                               {"request_id": "shared-request-id", "group_id": "group-1"})
+        assert status == 409, body
+        assert manager.created == []
+    finally:
+        gateway.stop()
+        root.cleanup()
+        temp.cleanup()
 
-        for altered in ("changed text",):
-            status, response = request(gateway, "POST", "/v1/sessions/session-1/prompt", HERMES,
-                                 {**body, "request_id": "prompt-2", "text": altered})
-            assert status == 409, response
-        status, _ = request(gateway, "POST", "/v1/sessions/session-1/prompt", HERMES,
-                             {**body, "request_id": "prompt-3", "proposal_hash": "a" * 64})
-        assert status == 409
+
+def test_open_session_route_blocks_on_emergency_stop_and_creates_no_session():
+    temp, gateway = setup_gateway()
+    root = tempfile.TemporaryDirectory()
+    manager = CreatePty()
+    gateway.stop()
+    gateway = AgentGateway(manager, Store(), Source(), Source(), port=0,
+                           hermes_token=HERMES, operator_token=OPERATOR,
+                           groups=[{"group_id": "group-1", "name": "Project", "path": root.name}])
+    gateway.start()
+    try:
+        assert gateway.set_emergency_stop(OPERATOR)
+        status, body = request(gateway, "POST", "/v1/sessions", HERMES,
+                               {"request_id": "create-stopped", "group_id": "group-1"})
+        assert status == 503 and body["error"] == "emergency_stop_active"
+        assert manager.created == []
+        assert gateway.clear_emergency_stop(OPERATOR)
+    finally:
+        gateway.stop()
+        root.cleanup()
+        temp.cleanup()
+
+
+def test_send_prompt_rejects_mismatched_text_and_hash_directly():
+    # Task 2: the gateway HTTP prompt route is gone (host-owned dispatch), so
+    # this exact-payload guard is exercised directly against pty_manager, the
+    # only remaining caller. A multiline, accented prompt exercises the
+    # bracketed-paste branch of prepare_composer_message at the same time.
+    temp = decisions_tmpdir()
+    try:
+        manager, session = prompt_manager()
+        text = "Faça um discovery read-only.\nInclua critérios de aceitação e atenção à acentuação."
+        proposal = make_proposal(action_type="send_prompt", text=text)
+        agent_decisions.create_proposal(proposal)
+        agent_decisions.approve(proposal["decision_id"], proposal["proposal_hash"], "user", "cap-direct")
+
+        receipt = manager.send_prompt("session-1", text, "req-direct",
+                                      proposal["decision_id"], proposal["proposal_hash"])
+        assert receipt["state"] == "SENT"
+        expected = prepare_composer_message(text, bracketed_paste_mode=True, provider="claude")
+        assert session.writes == [expected]
+
+        try:
+            manager.send_prompt("session-1", "changed text", "req-mismatch-text",
+                                proposal["decision_id"], proposal["proposal_hash"])
+        except ValueError as exc:
+            assert str(exc) == "prompt does not match approved proposal"
+        else:
+            raise AssertionError("mismatched text must be rejected")
+
+        try:
+            manager.send_prompt("session-1", text, "req-mismatch-hash",
+                                proposal["decision_id"], "a" * 64)
+        except ValueError as exc:
+            assert str(exc) == "proposal hash does not match"
+        else:
+            raise AssertionError("mismatched proposal_hash must be rejected")
+
+        assert len(session.writes) == 1
+    finally:
+        temp.cleanup()
+
+
+def test_approve_agent_proposal_dispatches_immediately_and_returns_host_write_accepted():
+    temp = decisions_tmpdir()
+    try:
+        manager, session = prompt_manager()
+        bridge = make_bridge(manager)
+        text = "Multilinha\ncom acentuação e cedilha: ação, coração."
+        proposal = make_proposal(action_type="send_prompt", text=text)
+        agent_decisions.create_proposal(proposal)
+
+        receipt = approve_with_capability(bridge, proposal["decision_id"], proposal["proposal_hash"])
+        assert receipt["state"] == "HOST_WRITE_ACCEPTED"
+        assert receipt["retryable"] is False
+        assert receipt["decision_id"] == proposal["decision_id"]
+
+        expected = prepare_composer_message(text, bracketed_paste_mode=True, provider="claude")
+        assert session.writes == [expected]
+        decision = agent_decisions.get_decision(proposal["decision_id"])
+        assert decision["execution"]["state"] == "SENT"
+        assert agent_decisions.verify_audit_chain()
+    finally:
+        temp.cleanup()
+
+
+def test_bridge_approve_reports_provider_processing_unknown_when_pty_write_returns_false():
+    temp = decisions_tmpdir()
+    try:
+        manager, _session = prompt_manager(FailingPromptSession())
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="will fail")
+        agent_decisions.create_proposal(proposal)
+
+        receipt = approve_with_capability(bridge, proposal["decision_id"], proposal["proposal_hash"])
+        assert receipt["state"] == "PROVIDER_PROCESSING_UNKNOWN"
+        assert receipt["retryable"] is False
+        assert receipt["execution"]["result"]["provider_processed"] is False
+        decision = agent_decisions.get_decision(proposal["decision_id"])
+        assert decision["execution"]["state"] == "UNKNOWN"
+    finally:
+        temp.cleanup()
+
+
+def test_retry_after_successful_dispatch_hits_idempotent_fast_path_with_no_second_write():
+    # This is the exact scenario the deterministic uuid5 request_id exists to
+    # protect (review finding #6): a double-click, or the UI retrying against a
+    # stale "awaiting_dispatch" view after the write already succeeded. A
+    # retry must replay the same receipt, not attempt a second PTY write or
+    # trip execute_approved's "decision already has another execution
+    # request" ConflictError.
+    temp = decisions_tmpdir()
+    try:
+        manager, session = prompt_manager()
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="do not send twice")
+        agent_decisions.create_proposal(proposal)
+
+        first = approve_with_capability(bridge, proposal["decision_id"], proposal["proposal_hash"])
+        assert first["state"] == "HOST_WRITE_ACCEPTED"
         assert len(session.writes) == 1
 
         token = bridge._issue_operator_capability(proposal["decision_id"], proposal["proposal_hash"])
@@ -404,11 +543,40 @@ def test_reject_agent_proposal_never_dispatches_a_write():
         temp.cleanup()
 
 
+def test_open_session_undoes_pty_creation_when_journal_write_fails():
+    # Owed test: record_automatic_action failing on the automatic open_session
+    # route must close the just-created session and leave nothing journaled,
+    # not leak an unlinked tab (see agent_gateway._handle_session_create).
+    temp, gateway = setup_gateway()
+    root = tempfile.TemporaryDirectory()
+    manager = CreatePty()
+    gateway.stop()
+    gateway = AgentGateway(manager, Store(), Source(), Source(), port=0,
+                           hermes_token=HERMES, operator_token=OPERATOR,
+                           groups=[{"group_id": "group-1", "name": "Project", "path": root.name}])
+    gateway.start()
+    original_record = agent_decisions.record_automatic_action
+
+    def failing_record(*args, **kwargs):
+        raise agent_decisions.AuditStorageError("disk full")
+
+    agent_decisions.record_automatic_action = failing_record
+    try:
+        status, body = request(gateway, "POST", "/v1/sessions", HERMES,
+                               {"request_id": "create-undo", "group_id": "group-1"})
+        assert status == 503 and body["error"] == "session_creation_unavailable", body
+        assert manager.closed == ["private-id"]
+        assert agent_decisions.find_automatic_action("create-undo") is None
+    finally:
+        agent_decisions.record_automatic_action = original_record
         gateway.stop()
+        root.cleanup()
         temp.cleanup()
 
 
 def test_open_session_concurrent_replay_creates_one_session_and_returns_same_receipt():
+    # Two concurrent POSTs with the same request_id and no decision at all must
+    # still create exactly one session and return the same payload to both.
     temp, gateway = setup_gateway()
     root = tempfile.TemporaryDirectory()
     manager = ConcurrentCreatePty()
@@ -417,11 +585,7 @@ def test_open_session_concurrent_replay_creates_one_session_and_returns_same_rec
                            hermes_token=HERMES, operator_token=OPERATOR,
                            groups=[{"group_id": "group-1", "name": "Project", "path": root.name}])
     gateway.start()
-    proposal = make_proposal()
-    agent_decisions.create_proposal(proposal)
-    agent_decisions.approve(proposal["decision_id"], proposal["proposal_hash"], "user", "cap-concurrent")
-    body = {"decision_id": proposal["decision_id"], "proposal_hash": proposal["proposal_hash"],
-            "request_id": "create-concurrent", "group_id": "group-1"}
+    body = {"request_id": "create-concurrent", "group_id": "group-1"}
     results = []
     barrier = threading.Barrier(2)
 
@@ -436,6 +600,7 @@ def test_open_session_concurrent_replay_creates_one_session_and_returns_same_rec
         for thread in threads:
             thread.join()
         assert [status for status, _ in results] == [201, 201]
+        assert results[0] == results[1]
         assert len(manager.created) == 1
     finally:
         gateway.stop()
@@ -682,6 +847,83 @@ def test_operator_capability_purge_evicts_stale_entries_left_by_decisions_no_lon
 
     assert stale_token not in bridge._operator_capabilities
     assert "decision-old" not in bridge._capability_by_decision
+
+
+def test_execution_lock_serializes_concurrent_same_request_id_and_evicts_after_release():
+    temp, gateway = setup_gateway()
+    try:
+        concurrency = {"active": 0, "max_active": 0}
+        guard = threading.Lock()
+
+        def worker():
+            with gateway._execution_lock("shared-request"):
+                with guard:
+                    concurrency["active"] += 1
+                    concurrency["max_active"] = max(concurrency["max_active"], concurrency["active"])
+                time.sleep(0.05)
+                with guard:
+                    concurrency["active"] -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(2)
+
+        # Mutual exclusion held throughout the refactor: never two threads
+        # inside the critical section for the same request_id at once.
+        assert concurrency["max_active"] == 1
+        # And the entry is fully evicted once nobody holds a reference anymore
+        # (the actual fix for the monotonic per-request_id leak).
+        assert "shared-request" not in gateway._execution_locks
+    finally:
+        gateway.stop()
+        temp.cleanup()
+
+
+def test_execution_lock_single_use_is_evicted_immediately_after_the_with_block():
+    temp, gateway = setup_gateway()
+    try:
+        with gateway._execution_lock("solo-request"):
+            assert "solo-request" in gateway._execution_locks
+            assert gateway._execution_locks["solo-request"]["refcount"] == 1
+        assert "solo-request" not in gateway._execution_locks
+    finally:
+        gateway.stop()
+        temp.cleanup()
+
+
+def test_hermes_publisher_status_is_readable_and_never_raises():
+    # The publisher disables itself permanently on 401/403/404 instead of
+    # retrying, which is only better than silent retries if an operator can see
+    # it. This bridge read is that surface, so it must survive every case.
+    temp = decisions_tmpdir()
+    try:
+        manager, _session = prompt_manager()
+        bridge = make_bridge(manager)
+
+        # Never started (no secret configured): "off" is a state, not an error.
+        assert bridge.get_hermes_publisher_status() == {
+            "state": "off", "reason": "not_configured"}
+
+        class FakePublisher:
+            def status(self):
+                return {"state": "disabled", "reason": "auth_rejected", "counters": {}}
+
+        bridge.set_hermes_publisher(FakePublisher())
+        assert bridge.get_hermes_publisher_status()["state"] == "disabled"
+        assert bridge.get_hermes_publisher_status()["reason"] == "auth_rejected"
+
+        class BrokenPublisher:
+            def status(self):
+                raise RuntimeError("thread is gone")
+
+        bridge.set_hermes_publisher(BrokenPublisher())
+        broken = bridge.get_hermes_publisher_status()
+        assert broken["state"] == "unknown"
+        assert broken["reason"] == "RuntimeError"
+    finally:
+        temp.cleanup()
 
 
 if __name__ == "__main__":

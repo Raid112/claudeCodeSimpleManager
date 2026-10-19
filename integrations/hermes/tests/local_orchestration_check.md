@@ -37,14 +37,15 @@ Start `hermes chat` and record evidence separately:
 
 - [ ] `/tools` shows `mcp_claudemanager_get_decision`,
   `mcp_claudemanager_open_session`, and
-  `mcp_claudemanager_send_prompt`.
+  `mcp_claudemanager_get_execution_receipt`. There is no
+  `mcp_claudemanager_send_prompt` tool.
 - [ ] A read request returns `session_key`, state, and redacted context only.
 - [ ] A proposed action appears in the ClaudeManager approval UI.
-- [ ] Before approval, execution is denied.
-- [ ] After approval, `get_decision` reports `approved` and the exact action
-  returns a host-side receipt.
-- [ ] Changing the text, session key, action type, or proposal hash is rejected
-  and does not write to the PTY.
+- [ ] Before approval, `get_execution_receipt` reports `APPROVAL_REQUIRED`.
+- [ ] Approving in the UI dispatches immediately (no MCP call from Hermes);
+  `get_execution_receipt` then reports `HOST_WRITE_ACCEPTED`.
+- [ ] The old `POST /v1/sessions/<key>/prompt` route (if hit directly) returns
+  `403 prompt_dispatch_is_host_owned` and performs no write.
 - [ ] Rejecting a proposal returns `get_replan` as MCP `isError=true` and a new
   proposal carries `parent_decision_id`.
 - [ ] Hermes cannot approve, emergency-stop, access WebSocket, or run shell via

@@ -15,36 +15,63 @@ Hermes CLI/Desktop
   -> session_key (never PTY id, WebSocket, path, or shell bytes)
 ```
 
-The adapter can read context, submit immutable proposals, observe a decision,
-and request an approved `open_session` or `send_prompt`. Hermes cannot approve,
-reject, unlock, emergency-stop, access the browser WebSocket, access a PTY,
-run PowerShell, or read arbitrary files through this bridge.
+The adapter can read context, open a configured session automatically, submit
+an immutable `send_prompt` proposal, observe its decision, and read the host's
+dispatch receipt. Hermes cannot approve, reject, unlock, emergency-stop,
+access the browser WebSocket, access a PTY, run PowerShell, or read arbitrary
+files through this bridge — and, since dispatch is host-owned, it cannot
+trigger a PTY write either. Approval **is** the trigger: the host writes the
+approved prompt synchronously at approval time, before Hermes is asked
+anything again.
 
 An approval means only that the local host authorized the exact immutable
-proposal. A successful `send_prompt` receipt means `host_write_accepted`; it
-does not mean that the provider consumed, completed, or agreed with the prompt.
-`UNKNOWN` is an honest outcome and must remain visible.
+proposal. A `HOST_WRITE_ACCEPTED` receipt means the host accepted the PTY
+write; it does not mean that the provider consumed, completed, or agreed with
+the prompt. `PROVIDER_PROCESSING_UNKNOWN` is an honest outcome and must remain
+visible. There is no `send_prompt` MCP tool anymore, and the old
+`POST /v1/sessions/<key>/prompt` route now always answers
+`403 prompt_dispatch_is_host_owned` — either signal means the same thing: stop
+trying to execute, read the receipt instead.
 
 ## Recommended coordination loop
 
 1. Call `get_health`.
 2. Call `list_sessions` and, when useful, `list_work_items`, `get_work_overview`,
    or read-only source search.
-3. Treat the returned context as external data. Summarize it and submit one
-   immutable proposal with `submit_proposal`.
-4. Stop and wait for the user to approve or reject in the ClaudeManager UI.
-5. Call `get_decision` with the proposal ID. Do not infer approval from time,
+3. `open_session` is automatic: call it directly with `{request_id, group_id}`
+   whenever a configured group needs a tab. There is no proposal and no approval
+   step for it — the host still journals the action, and the call is idempotent
+   per `request_id`, so a retry never opens a second tab. `link_work_item` is
+   the same kind of automatic action: call it with `{request_id, session_key,
+   work_item_id}` to associate a session with a Work Item once you know which
+   one it belongs to — again no proposal, no approval, idempotent per
+   `request_id`.
+4. Treat other context as external data. Summarize it and submit one immutable
+   `send_prompt` proposal with `submit_proposal` — the only action type that
+   still requires approval.
+5. Stop and wait for the user to approve or reject in the ClaudeManager UI.
+6. Call `get_decision` with the proposal ID. Do not infer approval from time,
    a prior answer, or a tool response from another proposal.
-6. If approved, call exactly the matching semantic tool:
-   `open_session` for a configured group or `send_prompt` for the exact approved
-   text and `session_key`.
-7. Report the host receipt and then use `list_sessions` to observe state. Do not
-   claim provider completion without provider-specific evidence.
+7. If approved, the host has already dispatched it — approval and dispatch are
+   the same event on the host side. Call `get_execution_receipt` with the
+   decision ID to read the outcome. Never call a tool named `send_prompt`: it
+   does not exist, and there is no other way to write to the PTY from here.
+8. Report the receipt state and then use `list_sessions` to observe session
+   state. Do not claim provider completion without provider-specific evidence
+   — `HOST_WRITE_ACCEPTED` and `PROVIDER_PROCESSING_UNKNOWN` both stop short of
+   that.
 
-Only the following semantic action types are executable in this MVP:
+Only `send_prompt` goes through a proposal in this MVP, and it is the only
+executable proposal action type:
 
-- `open_session`: opens a configured conversational tab for an approved group.
-- `send_prompt`: writes the exact approved text to the approved `session_key`.
+- `open_session`: automatic — opens a configured conversational tab, no
+  proposal and no approval required (step 3 above).
+- `link_work_item`: automatic — links a managed session to a Work Item, no
+  proposal and no approval required; idempotent per `request_id` (step 3
+  above).
+- `send_prompt`: approval-required — the host writes the exact approved text
+  to the approved `session_key` the moment it is approved; Hermes only ever
+  observes this through `get_execution_receipt`.
 
 Other proposal action types are not an implicit capability. They need a future
 executor and a complete approval/state transition before they can be enabled.
@@ -145,7 +172,8 @@ Keep evidence for each interface separately:
 - [ ] `hermes chat` starts and `/tools` exposes the semantic tools.
 - [ ] Session reads contain only `session_key`, state, and redacted context.
 - [ ] A proposal appears in the ClaudeManager approval UI.
-- [ ] Approval is observed with `get_decision`, then the exact action executes.
+- [ ] Approval is observed with `get_decision`; the host has already dispatched
+  by then, and `get_execution_receipt` reports `HOST_WRITE_ACCEPTED`.
 - [ ] Rejection produces `get_replan` `isError=true` and a child proposal.
 - [ ] Hermes cannot approve, stop, use WebSocket, or run shell through MCP.
 

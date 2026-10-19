@@ -22,11 +22,41 @@ MODEL_NAME = "gpt-5.6-luna"
 ACTION_OPEN_SESSION = "open_session"
 ACTION_SEND_PROMPT = "send_prompt"
 ACTION_LINK_WORK_ITEM = "link_work_item"
+# Remote lane: Hermes prompting a tab it opened itself, with nobody at the PC to
+# approve. Claude Code's own permission prompts still gate shell and file writes
+# inside that tab; this only removes the ClaudeManager-level approval.
+ACTION_SEND_OWNED_PROMPT = "send_owned_prompt"
+
+# Only send_prompt goes through a proposal at all now. open_session and
+# link_work_item are automatic coordination actions (see ACTION_POLICY below) —
+# they moved out of the approval path entirely, not into a lighter-weight one.
 ALLOWED_ACTIONS = frozenset({
-    ACTION_OPEN_SESSION,
     ACTION_SEND_PROMPT,
-    ACTION_LINK_WORK_ITEM,
 })
+
+POLICY_AUTOMATIC = "automatic"
+POLICY_APPROVAL_REQUIRED = "approval_required"
+POLICY_DENY_ALWAYS = "deny_always"
+
+# The single source of truth for "does this action type need approval?". A route
+# or MCP tool must consult this instead of re-deriving the answer from
+# ALLOWED_ACTIONS, so the two vocabularies (proposable vs approval-required)
+# cannot drift apart.
+ACTION_POLICY = {
+    ACTION_OPEN_SESSION: POLICY_AUTOMATIC,
+    ACTION_LINK_WORK_ITEM: POLICY_AUTOMATIC,
+    ACTION_SEND_OWNED_PROMPT: POLICY_AUTOMATIC,
+    ACTION_SEND_PROMPT: POLICY_APPROVAL_REQUIRED,
+}
+
+
+def action_policy(action_type: str) -> str:
+    """Return the policy for an action type; anything not in the table is deny-always.
+
+    Deny-always is the default, not "unknown" — a new action type must be added to
+    ACTION_POLICY deliberately before any route can execute it.
+    """
+    return ACTION_POLICY.get(action_type, POLICY_DENY_ALWAYS)
 
 STATUS_PROPOSED = "proposed"
 STATUS_AWAITING_APPROVAL = "awaiting_approval"
@@ -179,24 +209,16 @@ def _validate_action(action: Any, errors: list[str]) -> None:
         errors.append("action.reversible must be true")
     target = action.get("target") if isinstance(action.get("target"), dict) else {}
     parameters = action.get("parameters") if isinstance(action.get("parameters"), dict) else {}
-    if action_type == ACTION_OPEN_SESSION:
-        _identifier(target.get("group_id"), "action.target.group_id", errors)
-        if target.keys() - {"group_id"}:
-            errors.append("action.target has unsupported open_session fields")
-    elif action_type == ACTION_SEND_PROMPT:
-        _identifier(target.get("session_key"), "action.target.session_key", errors)
-        _safe_text(parameters.get("text"), "action.parameters.text", errors, 12000)
-        if target.keys() - {"session_key"}:
-            errors.append("action.target has unsupported send_prompt fields")
-        if parameters.keys() - {"text"}:
-            errors.append("action.parameters has unsupported send_prompt fields")
-    elif action_type == ACTION_LINK_WORK_ITEM:
-        _identifier(target.get("session_key"), "action.target.session_key", errors)
-        _identifier(parameters.get("work_item_id"), "action.parameters.work_item_id", errors)
-        if target.keys() - {"session_key"}:
-            errors.append("action.target has unsupported link_work_item fields")
-        if parameters.keys() - {"work_item_id"}:
-            errors.append("action.parameters has unsupported link_work_item fields")
+    # ALLOWED_ACTIONS is now exactly {ACTION_SEND_PROMPT} — an action.type outside
+    # it already returned above, so reaching here means send_prompt. The former
+    # open_session/link_work_item branches are gone: those actions no longer have
+    # a proposal shape to validate at all (they are automatic, see ACTION_POLICY).
+    _identifier(target.get("session_key"), "action.target.session_key", errors)
+    _safe_text(parameters.get("text"), "action.parameters.text", errors, 12000)
+    if target.keys() - {"session_key"}:
+        errors.append("action.target has unsupported send_prompt fields")
+    if parameters.keys() - {"text"}:
+        errors.append("action.parameters has unsupported send_prompt fields")
 
 
 def validate_proposal(payload: dict) -> tuple[bool, list[str]]:

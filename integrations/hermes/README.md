@@ -50,14 +50,19 @@ token is missing.
   read-only source tools provide redacted context.
 - `submit_proposal` creates an immutable approval request.
 - `get_decision` reads redacted decision state after the local UI acts.
-- `open_session` and `send_prompt` execute only the exact approved action.
+- `open_session` executes automatically, no proposal or approval required.
+- `get_execution_receipt` reads the host's dispatch outcome for an approved
+  `send_prompt` decision. There is no `send_prompt` tool: the host dispatches
+  the approved prompt itself at approval time, so Hermes can only observe the
+  result, never trigger the write.
 - `get_replan` returns rejection feedback as `isError=true` so Hermes reasons
   again and submits a versioned child proposal.
 
 The host verifies `decision_id`, `proposal_hash`, action type, target, exact
 prompt text, expiry, approval status, and request idempotency before writing or
-creating a tab. A receipt is host-side evidence only: `host_write_accepted`
-does not claim provider completion, and `UNKNOWN` remains visible.
+creating a tab. A receipt is host-side evidence only: `HOST_WRITE_ACCEPTED`
+does not claim provider completion, and `PROVIDER_PROCESSING_UNKNOWN` remains
+visible.
 
 ## Diagnostics
 
