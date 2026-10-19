@@ -164,7 +164,15 @@ class App {
 
         // Status polling
         setInterval(() => this.refreshStatus(), 2000);
-        setInterval(() => this.agentApprovals.refresh(), 2000);
+        // Skip the poll while a dispatch (approve/retry) is in flight: dispatch
+        // is synchronous and can visibly block on the pywebview thread (Task 2),
+        // so a poll firing mid-dispatch would just queue behind it and then
+        // re-render the card out from under the pending "Enviando…" state.
+        // refresh() itself also guards on this, but checking here first skips
+        // the round trip entirely instead of firing it and discarding the result.
+        setInterval(() => {
+            if (!this.agentApprovals.dispatchInFlight) this.agentApprovals.refresh();
+        }, 2000);
 
         // Cache-timer tick — re-render tab bar each 15s so MM:SS counts down visibly
         // without coupling to the heavier 2s status poll.

@@ -156,7 +156,7 @@ body.col-resizing {
 .agent-approval-field { margin: 2px 0; overflow-wrap: anywhere; }
 .agent-approval-label { color: var(--text-secondary); }
 .agent-approval-actions { margin-top: 7px; justify-content: flex-start; }
-.agent-approval-actions button, .agent-stop-btn {
+.agent-approval-actions button, .agent-stop-btn, .aa-retry, .aa-dismiss, .aa-copy {
     border: 1px solid var(--border-dim);
     color: var(--text-primary);
     background: transparent;
@@ -164,9 +164,93 @@ body.col-resizing {
     padding: 3px 6px;
     font-size: 10px;
 }
-.agent-approval-actions button:hover, .agent-stop-btn:hover { border-color: var(--accent); }
+.agent-approval-actions button:hover, .agent-stop-btn:hover,
+.aa-retry:hover, .aa-dismiss:hover, .aa-copy:hover { border-color: var(--accent); }
+.agent-approval-actions button:disabled { opacity: 0.5; cursor: default; }
 .agent-approvals-empty, .agent-stop-state { color: var(--text-dim); font-size: 10px; }
 .agent-stop-state { color: var(--danger); margin: 4px 0; }
+/* Publisher trouble is a warning, not a block: approvals still work, only Hermes
+   wake-ups are not being delivered. */
+.agent-publisher-state { color: var(--warning, #d19a34); font-size: 10px; margin: 4px 0; }
+
+/* Prompt-first card (Task 3): compact header, the prompt itself as the primary
+ * block, receipt state, and technical metadata tucked behind <details>. */
+.aa-card-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    align-items: baseline;
+    margin-bottom: 5px;
+}
+.aa-session { color: var(--text-primary); font-weight: 600; }
+.aa-wi { color: var(--status-waiting); }
+.aa-risk { text-transform: uppercase; letter-spacing: 0.5px; font-size: 9px; }
+.aa-risk-low { color: var(--status-ready); }
+.aa-risk-medium { color: var(--status-tooluse); }
+.aa-risk-high, .aa-risk-critical { color: var(--danger); }
+.aa-expiry { color: var(--text-dim); margin-left: auto; }
+
+.aa-prompt-wrap {
+    position: relative;
+    border: 1px solid var(--border-dim);
+    background: var(--bg-primary);
+    margin-bottom: 6px;
+}
+.aa-prompt {
+    margin: 0;
+    padding: 8px 8px 8px 10px;
+    max-height: 220px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: 'Cascadia Code', Consolas, 'Courier New', monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-primary);
+    user-select: text;
+}
+.aa-copy {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    padding: 2px 5px;
+    font-size: 9px;
+    background: var(--bg-tertiary);
+}
+
+.aa-hash-warning {
+    color: var(--danger);
+    font-size: 10px;
+    margin-bottom: 6px;
+}
+
+.aa-receipt {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 6px;
+    margin-bottom: 6px;
+    border: 1px solid var(--border-dim);
+    font-size: 10px;
+}
+.aa-receipt-host_write_accepted { border-color: var(--status-ready); color: var(--status-ready); }
+.aa-receipt-provider_processing_unknown { border-color: var(--status-tooluse); color: var(--status-tooluse); }
+.aa-receipt-write_failed { border-color: var(--danger); color: var(--danger); }
+.aa-receipt-awaiting { border-color: var(--status-waiting); color: var(--status-waiting); }
+.aa-receipt-reason { color: var(--text-secondary); }
+.aa-retry, .aa-dismiss { margin-left: auto; }
+
+.aa-details { margin-top: 4px; }
+.aa-details summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: 10px;
+    list-style: none;
+}
+.aa-details summary::-webkit-details-marker { display: none; }
+.aa-details-body { margin-top: 4px; }
+.aa-details-value { overflow-wrap: anywhere; }
 
 /* Group */
 .group {

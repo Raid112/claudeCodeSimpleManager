@@ -15,7 +15,11 @@ from terminal.pty_manager import PtyManager
 from terminal.ws_server import WebSocketServer
 from terminal import work_items, jira_client, teams_graph
 from terminal import agent_decisions
+from terminal import agent_contracts
 from terminal import ui_log
+from terminal.agent_contracts import ACTION_SEND_PROMPT, EXECUTION_SENT, EXECUTION_UNKNOWN
+from terminal.input_protocol import InputProtocolError
+
 # How often poll_wake may actually hit Graph. Matches teams_graph's own cache TTL: a
 # shorter interval would only re-read the same cached chats.
 WAKE_POLL_SECONDS = 120
@@ -23,6 +27,15 @@ WAKE_POLL_SECONDS = 120
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 SESSIONS_PATH = Path(__file__).parent.parent / "sessions.json"
 
+
+# Pre-write dispatch failures where retrying can actually succeed once the
+# operator fixes the world. Every other reason is permanent for this decision and
+# needs a replan, not a retry (see _receipt_after_dispatch_failure).
+_RETRYABLE_DISPATCH_REASONS = frozenset({
+    "session_not_found",      # reopen the tab, then retry
+    "emergency_stop_active",  # unlock, then retry
+    "unexpected_error",       # unclassified: allow one retry rather than dead-end
+})
 
 DEFAULT_LAYOUT = {"split_ratio": 0.6, "composer_collapsed": False,
                   "sidebar_width": 260, "locked_wi_id": None}
@@ -66,12 +79,24 @@ def _save_sessions(sessions: dict):
 class Bridge:
     """Exposed to JS as window.pywebview.api"""
 
+    # Fixed namespace for deriving the host dispatch request_id (see
+    # _host_dispatch_request_id). Arbitrary but must never change, or a retry
+    # issued after an app upgrade would mint a different request_id than the
+    # one already recorded for an in-flight decision.
+    _REQUEST_ID_NAMESPACE = uuid.UUID("d9f6a9b2-8b39-4a6b-9b0a-9a8f8e6d2c31")
+
     def __init__(self, pty_manager: PtyManager, ws_server: WebSocketServer):
         self.pty_manager = pty_manager
         self.ws_server = ws_server
         self._window: webview.Window | None = None
         self._toaster = None  # lazily created WindowsToaster (windows_toasts)
         self._operator_capabilities: dict[str, dict] = {}
+        # One live token per decision: reissuing discards the previous one instead
+        # of accumulating (see _issue_operator_capability). This is what actually
+        # bounds the map to O(pending decisions) instead of the old ~30/min-per-
+        # decision leak; the expiry purge on top of it only cleans up the tail end
+        # after a decision stops being polled at all (rejected/executed).
+        self._capability_by_decision: dict[str, str] = {}
         self._emergency_capability = secrets.token_urlsafe(32)
         self._hermes_publisher = None  # set by main.py; see set_hermes_publisher
         self._last_wake_poll = 0.0     # see poll_wake
@@ -320,37 +345,371 @@ class Bridge:
         return self.ws_server.actual_port
 
     # ---------- Hermes proposal review (UI-only authority) ----------
+    def _purge_expired_capabilities(self) -> None:
+        """Drop capability entries whose expiry has passed.
+
+        Only reissuing a token discards the *previous* token, so a decision that
+        stops being polled (rejected, executed, or the panel simply not open for a
+        while) leaves its last-issued token stranded past its own expires_at with
+        nothing left to supersede it. This sweep is what reclaims those, on top of
+        the per-decision single-token invariant in _issue_operator_capability.
+        """
+        now = time.time()
+        expired = [token for token, record in self._operator_capabilities.items()
+                  if record["expires_at"] <= now]
+        for token in expired:
+            del self._operator_capabilities[token]
+        for decision_id, token in list(self._capability_by_decision.items()):
+            if token not in self._operator_capabilities:
+                del self._capability_by_decision[decision_id]
+
     def _issue_operator_capability(self, decision_id: str, proposal_hash: str) -> str:
+        """Issue the one live capability token for this decision.
+
+        Reissuing (every poll, so the approve/retry button always closes over a
+        fresh token) discards whatever token was live before for the same
+        decision_id -- this is the actual bound on growth (O(pending decisions)
+        steady-state), not just the expiry sweep, which only mops up the tail end
+        for a decision that stops being polled altogether. Because the previous
+        token is invalidated immediately, callers must always read the current
+        operator_capability off the latest fetched decision at click time, never
+        off a value captured earlier (see agent-approvals.js card patching).
+        """
+        self._purge_expired_capabilities()
+        old_token = self._capability_by_decision.get(decision_id)
+        if old_token is not None:
+            self._operator_capabilities.pop(old_token, None)
         token = secrets.token_urlsafe(32)
         self._operator_capabilities[token] = {
             "decision_id": decision_id,
             "proposal_hash": proposal_hash,
             "expires_at": time.time() + 120,
-            "used": False,
         }
+        self._capability_by_decision[decision_id] = token
         return token
 
     def _consume_operator_capability(self, token: str, decision_id: str, proposal_hash: str) -> bool:
         record = self._operator_capabilities.get(token)
-        if not record or record["used"] or record["expires_at"] <= time.time():
+        if not record or record["expires_at"] <= time.time():
             return False
         if record["decision_id"] != decision_id or record["proposal_hash"] != proposal_hash:
             return False
-        record["used"] = True
+        # Consumed exactly once: delete rather than flag "used", so a capability
+        # can never be found valid twice and never lingers in the map either.
+        del self._operator_capabilities[token]
+        if self._capability_by_decision.get(decision_id) == token:
+            del self._capability_by_decision[decision_id]
         return True
 
+    def _session_label(self, session_key: str | None) -> str | None:
+        """Human-readable tab identity for a decision's target session.
+
+        Best-effort only: a closed tab or a session_key the registry no longer
+        knows about must degrade to None, never raise -- the decision itself is
+        still worth showing to the operator even if we cannot name its tab.
+        """
+        if not session_key:
+            return None
+        try:
+            find_session = getattr(self.pty_manager, "find_by_session_key", None)
+            session = find_session(session_key) if find_session else None
+        except Exception:
+            return None
+        if session is None:
+            return None
+        try:
+            # Matches app.js getDisplayName's default ("<group> #<id[:4]>"); a
+            # frontend-side custom tab name is not visible here.
+            return f"{session.group_name} #{str(session.id)[:4]}"
+        except Exception:
+            return None
+
+    @staticmethod
+    def _resolve_work_item(store: dict, session_key: str | None,
+                           find_session) -> tuple[str | None, str]:
+        """Resolve the linked work item for a decision's target session.
+
+        session_links is keyed by claude_session_id for claude tabs and by
+        session_key for every other provider (see app.js sessionLinkKeyOf) --
+        try session_key first since that is what a send_prompt proposal always
+        carries, then fall back to the live session's claude_session_id if the
+        tab is still open. Any failure (closed tab, malformed store) degrades to
+        (None, ""), never raises.
+        """
+        if not session_key:
+            return None, ""
+        try:
+            links = store.get("session_links") or {}
+            link = links.get(session_key)
+            if link is None:
+                session = find_session(session_key)
+                csid = getattr(session, "claude_session_id", None) if session else None
+                if csid:
+                    link = links.get(csid)
+            if not link or not link.get("wi_id"):
+                return None, ""
+            wi_id = link["wi_id"]
+            item = next((it for it in store.get("items", []) if it.get("id") == wi_id), None)
+            return wi_id, ((item or {}).get("title") or "")
+        except Exception:
+            return None, ""
+
     def list_pending_agent_decisions(self) -> list[dict]:
+        """Display-ready view model for the approval UI.
+
+        Each item is derived from one raw journal decision (kept intact under
+        "raw" so nothing the journal knows is lost) plus two defensive joins --
+        session label and work item -- resolved via pty_manager/work_items and
+        degraded to null/"" rather than raised on any lookup failure. The prompt
+        text reaches here unredacted already (agent_decisions carries it plainly;
+        only the Hermes-facing gateway redacts), so this is just projection, not
+        a new read path.
+        """
         pending = agent_decisions.list_pending_decisions()
-        for item in pending:
-            item["operator_capability"] = self._issue_operator_capability(
-                item["decision_id"], item["proposal_hash"])
-        return pending
+        try:
+            store = work_items.load_store()
+        except Exception:
+            store = {"items": [], "session_links": {}}
+        # A fixture pty_manager in a test may not implement find_by_session_key at
+        # all; degrade to "no session found" rather than let the attribute lookup
+        # itself raise outside _session_label/_resolve_work_item's own try/except.
+        find_session = getattr(self.pty_manager, "find_by_session_key", lambda _key: None)
+        items = []
+        for state in pending:
+            proposal = state.get("proposal") or {}
+            action = proposal.get("action") or {}
+            target = action.get("target") or {}
+            parameters = action.get("parameters") or {}
+            risk = proposal.get("risk") or {}
+            session_key = target.get("session_key")
+            prompt_text = parameters.get("text") or ""
+            wi_id, wi_title = self._resolve_work_item(store, session_key, find_session)
+            items.append({
+                "decision_id": state["decision_id"],
+                "proposal_hash": state["proposal_hash"],
+                "pending_reason": state.get("pending_reason"),
+                "prompt_text": prompt_text,
+                "prompt_length": len(prompt_text),
+                "intent": proposal.get("intent"),
+                "expected_outcome": action.get("expected_outcome"),
+                "risk_level": risk.get("level"),
+                "expires_at": state.get("expires_at"),
+                "version": state.get("version"),
+                "parent_decision_id": state.get("parent_decision_id"),
+                "trace_id": proposal.get("trace_id"),
+                "session_key": session_key,
+                "session_label": self._session_label(session_key),
+                "work_item_id": wi_id,
+                "work_item_title": wi_title,
+                "operator_capability": self._issue_operator_capability(
+                    state["decision_id"], state["proposal_hash"]),
+                "raw": state,
+            })
+        return items
+
+    def verify_proposal_hash(self, decision_id: str, rendered_text: str | None = None) -> dict:
+        """Recompute the proposal hash in Python and report the verdict.
+
+        Recomputing agent_contracts.proposal_hash in JS would mean reproducing
+        json.dumps(sort_keys=True, ensure_ascii=False, separators=(",",":")) with
+        the proposal_hash/status pop -- fragile with unicode (review finding #9).
+        This is the one place that comparison happens.
+
+        ``found`` is separate from ``hash_ok`` on purpose: a decision remains
+        gettable by id forever (the journal never forgets), but the UI calls this
+        for cards it still has cached even after the decision left the pending
+        list, and a transient lookup miss must never render as "hash mismatch".
+        Only found and (not hash_ok) is a genuine integrity warning.
+        """
+        try:
+            decision = agent_decisions.get_decision(decision_id)
+        except Exception:
+            decision = None
+        if decision is None:
+            return {"found": False, "hash_ok": False, "text_ok": None,
+                    "prompt_length": 0, "proposal_hash": None}
+        proposal = decision.get("proposal") or {}
+        try:
+            recomputed = agent_contracts.proposal_hash(proposal)
+        except Exception:
+            recomputed = None
+        recorded_hash = decision.get("proposal_hash")
+        hash_ok = recomputed is not None and recomputed == recorded_hash
+        action = proposal.get("action") or {}
+        parameters = action.get("parameters") or {}
+        approved_text = parameters.get("text") or ""
+        text_ok = None if rendered_text is None else (rendered_text == approved_text)
+        return {
+            "found": True,
+            "hash_ok": hash_ok,
+            "text_ok": text_ok,
+            "prompt_length": len(approved_text),
+            "proposal_hash": recorded_hash,
+        }
 
     def approve_agent_proposal(self, decision_id: str, proposal_hash: str,
                                reviewer_id: str, capability: str) -> dict:
+        """Approve one proposal and, for send_prompt, dispatch it immediately.
+
+        Approval *is* the trigger now (Task 2): Hermes cannot reach the PTY
+        write through any MCP tool, so if the approved action is send_prompt
+        the host writes it synchronously, on this same call, and returns a
+        receipt instead of the bare decision. Dispatch takes the registry lock
+        plus the journal file lock and re-reads the whole hash chain, so this
+        runs on the pywebview bridge thread with a visible pending state in the
+        UI; move it to a worker with receipt polling only if that latency ever
+        becomes noticeable in practice.
+
+        Exceptions from the approval step itself (invalid/expired capability,
+        wrong status, hash mismatch) still raise exactly as before -- only a
+        failure at or after dispatch is translated into a WRITE_FAILED receipt
+        instead of an exception.
+        """
         if not self._consume_operator_capability(capability, decision_id, proposal_hash):
             raise PermissionError("invalid or expired operator capability")
-        return agent_decisions.approve(decision_id, proposal_hash, reviewer_id, capability)
+        decision = agent_decisions.approve(decision_id, proposal_hash, reviewer_id, capability)
+        action_type = ((decision.get("proposal") or {}).get("action") or {}).get("type")
+        if action_type != ACTION_SEND_PROMPT:
+            # Defensive only: ALLOWED_ACTIONS is currently exactly {send_prompt},
+            # so every approvable decision reaches here. Kept in case that ever
+            # changes so a future action type fails safe instead of dispatching.
+            return decision
+        request_id = self._host_dispatch_request_id(decision_id, proposal_hash)
+        return self._prompt_dispatch_receipt(decision, request_id)
+
+    def retry_prompt_dispatch(self, decision_id: str, proposal_hash: str, capability: str) -> dict:
+        """Re-attempt dispatch of an already-approved send_prompt decision.
+
+        Only reachable for a decision list_pending_decisions still tags
+        ``awaiting_dispatch`` (approved, no terminal execution recorded) -- a
+        pre-write failure left nothing in the journal, so a retry is safe. A
+        fresh operator capability is required: an approved-but-undispatched
+        decision must not become a capability-free write path just because the
+        approval already happened. Reuses the same deterministic request_id as
+        the original approval, so pty_manager.send_prompt's idempotent replay
+        path recognizes this as the same execution attempt rather than a
+        second, conflicting one.
+        """
+        if not self._consume_operator_capability(capability, decision_id, proposal_hash):
+            raise PermissionError("invalid or expired operator capability")
+        decision = agent_decisions.get_decision(decision_id)
+        if decision is None:
+            raise KeyError(decision_id)
+        if decision["proposal_hash"] != proposal_hash:
+            raise PermissionError("proposal hash does not match")
+        action_type = ((decision.get("proposal") or {}).get("action") or {}).get("type")
+        if action_type != ACTION_SEND_PROMPT:
+            raise ValueError("retry_prompt_dispatch only applies to send_prompt decisions")
+        request_id = self._host_dispatch_request_id(decision_id, proposal_hash)
+        return self._prompt_dispatch_receipt(decision, request_id)
+
+    def _host_dispatch_request_id(self, decision_id: str, proposal_hash_value: str) -> str:
+        """Derive the host's dispatch request_id deterministically from the decision.
+
+        uuid5 is a pure function of its inputs, so the same (decision_id,
+        proposal_hash) pair always yields the same request_id -- across a retry
+        after a pre-write failure, and across an app restart -- with nothing to
+        persist. This is what lets a retry hit pty_manager.send_prompt's
+        idempotent fast path instead of tripping execute_approved's "decision
+        already has another execution request" ConflictError.
+        """
+        return str(uuid.uuid5(self._REQUEST_ID_NAMESPACE, f"{decision_id}:{proposal_hash_value}"))
+
+    def _prompt_dispatch_receipt(self, decision: dict, request_id: str) -> dict:
+        decision_id = decision["decision_id"]
+        action = decision["proposal"].get("action") or {}
+        target = action.get("target") or {}
+        parameters = action.get("parameters") or {}
+        session_key = target.get("session_key")
+        text = parameters.get("text")
+        try:
+            execution = self.pty_manager.send_prompt(
+                session_key, text, request_id, decision_id, decision["proposal_hash"])
+        except Exception as exc:  # noqa: BLE001 - translated into a receipt, never re-raised
+            return self._receipt_after_dispatch_failure(decision_id, request_id, exc)
+        return self._execution_receipt(decision_id, request_id, execution)
+
+    def _receipt_after_dispatch_failure(self, decision_id: str, request_id: str,
+                                        exc: Exception) -> dict:
+        """Translate a send_prompt exception into a receipt by re-reading the
+        journal instead of trusting the exception type.
+
+        The exception type only supplies a human-readable ``reason``. Whether
+        the decision is safely retryable is decided by what actually landed in
+        the hash chain: an exception raised AFTER the PTY write (e.g.
+        append_execution_result failing on a full disk) must never be reported
+        as "nothing happened, retry safely" -- that risks a duplicate prompt
+        landing in the terminal on retry.
+        """
+        reason = self._dispatch_failure_reason(exc)
+        try:
+            decision = agent_decisions.get_decision(decision_id)
+        except Exception:
+            # Cannot even confirm what happened. Fail closed: never claim retryable.
+            return {
+                "decision_id": decision_id, "request_id": request_id,
+                "state": "PROVIDER_PROCESSING_UNKNOWN", "retryable": False, "reason": reason,
+            }
+        execution = (decision or {}).get("execution")
+        if not execution:
+            # execute_approved raised before any journal append: the write
+            # boundary was never crossed, so nothing happened. Retry is *safe*,
+            # but only worth offering when the operator can change the world and
+            # try again (reopen the tab, clear the emergency stop). An expired or
+            # mismatched proposal, a text the input protocol refuses, or a
+            # non-conversational tab can never succeed on retry — offering the
+            # button there just teaches the operator to click a dead control.
+            return {
+                "decision_id": decision_id, "request_id": request_id,
+                "state": "WRITE_FAILED",
+                "retryable": reason in _RETRYABLE_DISPATCH_REASONS,
+                "reason": reason,
+            }
+        if execution.get("state") in (EXECUTION_SENT, EXECUTION_UNKNOWN):
+            return self._execution_receipt(decision_id, request_id, execution)
+        # ACCEPTED (or any other non-terminal state) reached the journal, so the
+        # write boundary was crossed but the outcome was never recorded -- the
+        # same honest "we don't know" as pty_manager's own restart-recovery path.
+        return {
+            "decision_id": decision_id, "request_id": execution.get("request_id", request_id),
+            "state": "PROVIDER_PROCESSING_UNKNOWN", "retryable": False, "reason": reason,
+        }
+
+    @staticmethod
+    def _dispatch_failure_reason(exc: Exception) -> str:
+        """Human-readable reason code for display only -- never used to decide
+        retryable (see _receipt_after_dispatch_failure)."""
+        if isinstance(exc, KeyError):
+            return "session_not_found"
+        if isinstance(exc, InputProtocolError):  # subclass of ValueError: check first
+            return "invalid_input"
+        if isinstance(exc, PermissionError):
+            return "unsupported_provider" if "PowerShell" in str(exc) else "not_approved"
+        if isinstance(exc, agent_decisions.AuthorizationError):
+            return "emergency_stop_active"
+        if isinstance(exc, agent_decisions.ConflictError):
+            return "execution_conflict"
+        if isinstance(exc, ValueError):
+            return "proposal_expired" if str(exc) == "proposal_expired" else "proposal_mismatch"
+        return "unexpected_error"
+
+    @staticmethod
+    def _execution_receipt(decision_id: str, request_id: str, execution: dict) -> dict:
+        state = execution.get("state")
+        if state == EXECUTION_SENT:
+            mapped = "HOST_WRITE_ACCEPTED"
+        elif state == EXECUTION_UNKNOWN:
+            mapped = "PROVIDER_PROCESSING_UNKNOWN"
+        else:
+            # ACCEPTED reaching here would mean send_prompt returned without ever
+            # calling append_execution_result, which its own code never does (it
+            # always finishes at SENT/UNKNOWN or raises). Fail closed rather than
+            # claim a write was accepted.
+            mapped = "PROVIDER_PROCESSING_UNKNOWN"
+        return {
+            "decision_id": decision_id, "request_id": execution.get("request_id", request_id),
+            "state": mapped, "retryable": False, "execution": execution,
+        }
 
     def reject_agent_proposal(self, decision_id: str, proposal_hash: str, reviewer_id: str,
                               capability: str, reason_code: str, comment: str,

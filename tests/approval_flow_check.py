@@ -12,9 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from api.bridge import Bridge
 from terminal import agent_decisions
+from terminal import work_items
 from terminal.agent_contracts import proposal_hash
 from terminal.agent_gateway import AgentGateway
+from terminal.input_protocol import prepare_composer_message
 from terminal.pty_manager import PtyManager
 from terminal.session_registry import SessionRegistry
 
@@ -66,6 +69,24 @@ class FailingPromptSession(PromptSession):
         return False
 
 
+class LabeledSession(PromptSession):
+    """Adds group_name, which the bare PromptSession fixture never needed before
+    the Task 3 view model started reading it for session_label."""
+    id = "abcd1234"
+    group_name = "clones"
+    session_key = "session-1"
+    claude_session_id = "provider-1"
+
+
+class RetryableSession(PromptSession):
+    """A session that shows up under session-missing only after a retry --
+    stands in for a tab reopening under the exact session_key an approved
+    proposal targets."""
+    id = "late-pty"
+    session_key = "session-missing"
+    claude_session_id = "provider-late"
+
+
 def prompt_manager(session=None):
     manager = PtyManager.__new__(PtyManager)
     manager.sessions = {}
@@ -73,6 +94,27 @@ def prompt_manager(session=None):
     session = session or PromptSession()
     manager.registry.register(session)
     return manager, session
+
+
+def make_bridge(manager):
+    bridge = Bridge.__new__(Bridge)
+    bridge.pty_manager = manager
+    bridge.ws_server = None
+    bridge._operator_capabilities = {}
+    bridge._capability_by_decision = {}
+    bridge._hermes_publisher = None  # main.py injects the real one; None == never started
+    return bridge
+
+
+def approve_with_capability(bridge, decision_id, proposal_hash_value, reviewer_id="local-user"):
+    token = bridge._issue_operator_capability(decision_id, proposal_hash_value)
+    return bridge.approve_agent_proposal(decision_id, proposal_hash_value, reviewer_id, token)
+
+
+def decisions_tmpdir():
+    temp = tempfile.TemporaryDirectory()
+    os.environ["CLAUDEMANAGER_AGENT_DECISIONS_DIR"] = temp.name
+    return temp
 
 
 class Store:
@@ -252,7 +294,116 @@ def test_prompt_requires_exact_approved_action_target_and_payload():
                              {**body, "request_id": "prompt-3", "proposal_hash": "a" * 64})
         assert status == 409
         assert len(session.writes) == 1
+
+        token = bridge._issue_operator_capability(proposal["decision_id"], proposal["proposal_hash"])
+        second = bridge.retry_prompt_dispatch(proposal["decision_id"], proposal["proposal_hash"], token)
+
+        assert second["state"] == "HOST_WRITE_ACCEPTED"
+        assert second["request_id"] == first["request_id"]
+        assert len(session.writes) == 1  # no second write happened
+        assert agent_decisions.verify_audit_chain()
     finally:
+        temp.cleanup()
+
+
+def test_approve_agent_proposal_pre_write_failure_stays_retryable_and_then_retry_succeeds():
+    temp = decisions_tmpdir()
+    try:
+        manager, _unused = prompt_manager()  # only registers "session-1"
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="retry me")
+        proposal["action"]["target"]["session_key"] = "session-missing"
+        proposal["proposal_hash"] = proposal_hash(proposal)
+        agent_decisions.create_proposal(proposal)
+
+        first = approve_with_capability(bridge, proposal["decision_id"], proposal["proposal_hash"])
+        assert first["state"] == "WRITE_FAILED"
+        assert first["retryable"] is True
+        assert first["reason"] == "session_not_found"
+
+        # Nothing was journaled: the decision is still approved and retryable.
+        pending = agent_decisions.list_pending_decisions()
+        entry = next(d for d in pending if d["decision_id"] == proposal["decision_id"])
+        assert entry["pending_reason"] == "awaiting_dispatch"
+        assert entry["execution"] is None
+
+        # A retry without a valid capability must be refused.
+        try:
+            bridge.retry_prompt_dispatch(proposal["decision_id"], proposal["proposal_hash"], "stale-token")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("retry without a valid capability must be refused")
+
+        # The tab reopens under the exact session_key the approved proposal targets.
+        late_session = RetryableSession()
+        manager.registry.register(late_session)
+
+        # The UI's own listing path is what actually hands out the fresh capability.
+        pending = bridge.list_pending_agent_decisions()
+        entry = next(d for d in pending if d["decision_id"] == proposal["decision_id"])
+        assert entry["pending_reason"] == "awaiting_dispatch"
+        token = entry["operator_capability"]
+
+        second = bridge.retry_prompt_dispatch(proposal["decision_id"], proposal["proposal_hash"], token)
+        assert second["state"] == "HOST_WRITE_ACCEPTED"
+        assert second["request_id"] == first["request_id"]  # same uuid5, survives the retry
+        assert late_session.writes
+        assert agent_decisions.verify_audit_chain()
+    finally:
+        temp.cleanup()
+
+
+def test_prompt_dispatch_reports_write_failed_when_emergency_stop_flips_after_approval():
+    temp = decisions_tmpdir()
+    try:
+        manager, session = prompt_manager()
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="stopped mid-flight")
+        agent_decisions.create_proposal(proposal)
+        decision = agent_decisions.approve(
+            proposal["decision_id"], proposal["proposal_hash"], "local-user", "cap-race")
+
+        # Simulate the emergency stop flipping in the narrow window between
+        # agent_decisions.approve() succeeding and the dispatch call that
+        # follows it inside Bridge.approve_agent_proposal.
+        agent_decisions.set_emergency_stop("tester", "cap-emergency")
+        request_id = bridge._host_dispatch_request_id(proposal["decision_id"], proposal["proposal_hash"])
+        receipt = bridge._prompt_dispatch_receipt(decision, request_id)
+
+        assert receipt["state"] == "WRITE_FAILED"
+        assert receipt["retryable"] is True
+        assert receipt["reason"] == "emergency_stop_active"
+        assert session.writes == []
+
+        pending = agent_decisions.list_pending_decisions()
+        entry = next(d for d in pending if d["decision_id"] == proposal["decision_id"])
+        assert entry["pending_reason"] == "awaiting_dispatch"
+        assert agent_decisions.verify_audit_chain()
+    finally:
+        agent_decisions.clear_emergency_stop("tester", "cap-emergency")
+        temp.cleanup()
+
+
+def test_reject_agent_proposal_never_dispatches_a_write():
+    temp = decisions_tmpdir()
+    try:
+        manager, session = prompt_manager()
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="never sent")
+        agent_decisions.create_proposal(proposal)
+        token = bridge._issue_operator_capability(proposal["decision_id"], proposal["proposal_hash"])
+
+        result = bridge.reject_agent_proposal(
+            proposal["decision_id"], proposal["proposal_hash"], "local-user", token,
+            "wrong_scope", "not now")
+
+        assert result["status"] in {"replan_requested", "needs_clarification"}
+        assert session.writes == []
+    finally:
+        temp.cleanup()
+
+
         gateway.stop()
         temp.cleanup()
 
@@ -311,26 +462,226 @@ def test_expired_proposal_is_projected_and_cannot_be_approved_or_executed():
         temp.cleanup()
 
 
-def test_failed_host_write_returns_unknown_receipt_without_provider_completion():
+def test_gateway_prompt_route_is_host_owned_and_performs_no_write():
+    # The HTTP prompt route is a dead end now (Task 2): even a fully valid,
+    # approved decision gets the same fixed 403 and no PTY write, because
+    # dispatch only ever happens from Bridge.approve_agent_proposal / retry.
     temp, gateway = setup_gateway()
-    manager, _session = prompt_manager(FailingPromptSession())
+    manager, session = prompt_manager()
     gateway.stop()
     gateway = AgentGateway(manager, Store(), Source(), Source(), port=0,
                            hermes_token=HERMES, operator_token=OPERATOR)
     gateway.start()
     try:
-        proposal = make_proposal(action_type="send_prompt", text="will fail")
+        proposal = make_proposal(action_type="send_prompt", text="will not be sent this way")
         assert request(gateway, "POST", "/v1/proposals", HERMES, proposal)[0] == 201
-        agent_decisions.approve(proposal["decision_id"], proposal["proposal_hash"], "user", "cap-unknown")
+        agent_decisions.approve(proposal["decision_id"], proposal["proposal_hash"], "user", "cap-old-route")
         body = {"decision_id": proposal["decision_id"], "proposal_hash": proposal["proposal_hash"],
-                "request_id": "prompt-unknown", "text": "will fail"}
+                "request_id": "prompt-old-route", "text": "will not be sent this way"}
         status, result = request(gateway, "POST", "/v1/sessions/session-1/prompt", HERMES, body)
-        assert status == 200
-        assert result["receipt"]["state"] == "UNKNOWN"
-        assert result["receipt"]["result"]["provider_processed"] is False
+        assert status == 403 and result["error"] == "prompt_dispatch_is_host_owned"
+        assert session.writes == []
     finally:
         gateway.stop()
         temp.cleanup()
+
+
+def test_list_pending_agent_decisions_returns_typed_view_model_with_session_and_work_item():
+    temp = decisions_tmpdir()
+    original_load_store = work_items.load_store
+    try:
+        manager, _session = prompt_manager(LabeledSession())
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="Faça um discovery com acentuação")
+        agent_decisions.create_proposal(proposal)
+
+        work_items.load_store = lambda: {
+            "items": [{"id": "wi-1", "title": "Contrato em ativação"}],
+            "session_links": {"session-1": {"wi_id": "wi-1"}},
+        }
+        items = bridge.list_pending_agent_decisions()
+
+        assert len(items) == 1
+        item = items[0]
+        assert item["decision_id"] == proposal["decision_id"]
+        assert item["proposal_hash"] == proposal["proposal_hash"]
+        assert item["pending_reason"] == "awaiting_approval"
+        assert item["prompt_text"] == "Faça um discovery com acentuação"
+        assert item["prompt_length"] == len("Faça um discovery com acentuação")
+        assert item["intent"] == proposal["intent"]
+        assert item["expected_outcome"] == proposal["action"]["expected_outcome"]
+        assert item["risk_level"] == "low"
+        assert item["version"] == 1
+        assert item["parent_decision_id"] is None
+        assert item["trace_id"] == proposal["trace_id"]
+        assert item["session_key"] == "session-1"
+        assert item["session_label"] == "clones #abcd"
+        assert item["work_item_id"] == "wi-1"
+        assert item["work_item_title"] == "Contrato em ativação"
+        assert item["operator_capability"]
+        assert item["raw"]["decision_id"] == proposal["decision_id"]
+    finally:
+        work_items.load_store = original_load_store
+        temp.cleanup()
+
+
+def test_list_pending_agent_decisions_falls_back_to_claude_session_id_for_work_item_link():
+    # session_links is keyed by claude_session_id for claude tabs (app.js
+    # sessionLinkKeyOf); a proposal only ever carries the stable session_key, so
+    # the bridge must try the live session's claude_session_id as a fallback.
+    temp = decisions_tmpdir()
+    original_load_store = work_items.load_store
+    try:
+        manager, _session = prompt_manager(LabeledSession())
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="fallback path")
+        agent_decisions.create_proposal(proposal)
+
+        work_items.load_store = lambda: {
+            "items": [{"id": "wi-2", "title": "Linked via provider id"}],
+            "session_links": {"provider-1": {"wi_id": "wi-2"}},
+        }
+        item = bridge.list_pending_agent_decisions()[0]
+        assert item["work_item_id"] == "wi-2"
+        assert item["work_item_title"] == "Linked via provider id"
+    finally:
+        work_items.load_store = original_load_store
+        temp.cleanup()
+
+
+def test_list_pending_agent_decisions_degrades_defensively_when_tab_and_store_are_gone():
+    # A closed tab (find_by_session_key returns None) plus a missing link or a
+    # corrupt store must degrade to null/"" and never raise -- the decision is
+    # still worth showing even with no session/work-item context left to join.
+    # An ARCHIVED link is NOT "missing": set_waiting() archives every link of a
+    # waiting item, and blanking the work item there contradicted the Work Item
+    # panel, which joins without that sensitivity.
+    temp = decisions_tmpdir()
+    original_load_store = work_items.load_store
+    try:
+        manager, _session = prompt_manager()  # registers "session-1", not the target below
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="orphaned")
+        proposal["action"]["target"]["session_key"] = "session-closed"
+        proposal["proposal_hash"] = proposal_hash(proposal)
+        agent_decisions.create_proposal(proposal)
+
+        # Archived link, item still in the store: id AND title survive.
+        work_items.load_store = lambda: {
+            "items": [{"id": "wi-3", "title": "Item em espera"}],
+            "session_links": {"session-closed": {"wi_id": "wi-3", "archived": True}},
+        }
+        item = bridge.list_pending_agent_decisions()[0]
+        assert item["session_label"] is None  # tab is closed, nothing to label
+        assert item["work_item_id"] == "wi-3"
+        assert item["work_item_title"] == "Item em espera"
+
+        # No link at all for this session: degrade to null/"".
+        work_items.load_store = lambda: {"items": [], "session_links": {}}
+        item = bridge.list_pending_agent_decisions()[0]
+        assert item["session_label"] is None
+        assert item["work_item_id"] is None
+        assert item["work_item_title"] == ""
+
+        work_items.load_store = lambda: (_ for _ in ()).throw(RuntimeError("store is corrupt"))
+        item = bridge.list_pending_agent_decisions()[0]
+        assert item["work_item_id"] is None
+        assert item["work_item_title"] == ""
+    finally:
+        work_items.load_store = original_load_store
+        temp.cleanup()
+
+
+def test_verify_proposal_hash_confirms_match_and_reports_prompt_length():
+    temp = decisions_tmpdir()
+    try:
+        manager, _session = prompt_manager()
+        bridge = make_bridge(manager)
+        text = "Confere byte a byte: ação, coração,ções."
+        proposal = make_proposal(action_type="send_prompt", text=text)
+        agent_decisions.create_proposal(proposal)
+
+        result = bridge.verify_proposal_hash(proposal["decision_id"], rendered_text=text)
+        assert result == {
+            "found": True, "hash_ok": True, "text_ok": True,
+            "prompt_length": len(text), "proposal_hash": proposal["proposal_hash"],
+        }
+        # No rendered_text supplied: text_ok stays None rather than False.
+        no_text = bridge.verify_proposal_hash(proposal["decision_id"])
+        assert no_text["hash_ok"] is True and no_text["text_ok"] is None
+    finally:
+        temp.cleanup()
+
+
+def test_verify_proposal_hash_flags_a_recorded_hash_that_does_not_match_the_proposal():
+    # validate_proposal refuses a mismatched hash outright, so this state cannot
+    # be reached through create_proposal -- monkeypatch get_decision instead
+    # (same technique as the record_automatic_action failure injection above).
+    temp = decisions_tmpdir()
+    original_get_decision = agent_decisions.get_decision
+    try:
+        manager, _session = prompt_manager()
+        bridge = make_bridge(manager)
+        proposal = make_proposal(action_type="send_prompt", text="tampered")
+        tampered_decision = {
+            "proposal": proposal,
+            "proposal_hash": "0" * 64,  # does not match proposal_hash(proposal)
+        }
+        agent_decisions.get_decision = lambda decision_id: (
+            tampered_decision if decision_id == "d-tampered" else None)
+
+        result = bridge.verify_proposal_hash("d-tampered", rendered_text="different rendered text")
+        assert result["found"] is True
+        assert result["hash_ok"] is False
+        assert result["text_ok"] is False
+        assert result["prompt_length"] == len("tampered")
+        assert result["proposal_hash"] == "0" * 64
+    finally:
+        agent_decisions.get_decision = original_get_decision
+        temp.cleanup()
+
+
+def test_verify_proposal_hash_not_found_is_distinct_from_a_hash_mismatch():
+    temp = decisions_tmpdir()
+    try:
+        bridge = make_bridge(prompt_manager()[0])
+        result = bridge.verify_proposal_hash("does-not-exist")
+        assert result == {
+            "found": False, "hash_ok": False, "text_ok": None,
+            "prompt_length": 0, "proposal_hash": None,
+        }
+    finally:
+        temp.cleanup()
+
+
+def test_operator_capability_reissue_discards_the_previous_token_and_stays_bounded():
+    bridge = make_bridge(Pty())
+    decision_id, proposal_hash_value = "decision-x", "h" * 64
+
+    tokens = [bridge._issue_operator_capability(decision_id, proposal_hash_value) for _ in range(50)]
+
+    # Only the latest token for this decision survives -- the actual bound on
+    # steady-state growth, not just the expiry sweep.
+    assert len(bridge._operator_capabilities) == 1
+    assert bridge._capability_by_decision[decision_id] == tokens[-1]
+    assert not bridge._consume_operator_capability(tokens[0], decision_id, proposal_hash_value)
+    assert bridge._consume_operator_capability(tokens[-1], decision_id, proposal_hash_value)
+    # Consumed exactly once: gone from both maps, not merely flagged used.
+    assert bridge._operator_capabilities == {}
+    assert decision_id not in bridge._capability_by_decision
+
+
+def test_operator_capability_purge_evicts_stale_entries_left_by_decisions_no_longer_polled():
+    bridge = make_bridge(Pty())
+    stale_token = bridge._issue_operator_capability("decision-old", "h" * 64)
+    bridge._operator_capabilities[stale_token]["expires_at"] = time.time() - 1
+
+    # Issuing for an unrelated decision must sweep the stale one too, not just
+    # bound the decision it was issued for.
+    bridge._issue_operator_capability("decision-new", "h" * 64)
+
+    assert stale_token not in bridge._operator_capabilities
+    assert "decision-old" not in bridge._capability_by_decision
 
 
 if __name__ == "__main__":

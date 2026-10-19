@@ -392,16 +392,35 @@ def get_decision(decision_id: str) -> dict | None:
 
 
 def list_pending_decisions() -> list[dict]:
+    """Decisions the UI still needs to act on or watch.
+
+    Two reasons land here, tagged by ``pending_reason``:
+    - ``awaiting_approval``: the original set (unchanged behaviour).
+    - ``awaiting_dispatch``: an *approved* send_prompt whose execution is absent
+      or not yet terminal. A pre-write dispatch failure records no execution at
+      all, so the decision must stay visible and retryable rather than vanish
+      the instant it is approved. SENT and UNKNOWN are the terminal execution
+      states (already dispatched, outcome known-or-honestly-unknown); ACCEPTED/
+      DISPATCHED or an absent execution are not terminal and stay pending.
+    """
     with _PROCESS_LOCK, _FileLock():
         states = _all_states_unlocked()
-        pending = {
+        awaiting_approval = {
             STATUS_AWAITING_APPROVAL, STATUS_REPLAN_REQUESTED, STATUS_NEEDS_CLARIFICATION
         }
+        terminal_execution_states = {EXECUTION_SENT, EXECUTION_UNKNOWN}
         result = []
         for state in states.values():
             projected = _project_status(state)
-            if projected["status"] in pending:
+            status = projected["status"]
+            if status in awaiting_approval:
+                projected["pending_reason"] = "awaiting_approval"
                 result.append(projected)
+            elif status == STATUS_APPROVED:
+                execution = projected.get("execution")
+                if not execution or execution.get("state") not in terminal_execution_states:
+                    projected["pending_reason"] = "awaiting_dispatch"
+                    result.append(projected)
         return result
 
 

@@ -56,6 +56,8 @@ def test_line_endings_final_newline_and_bracketed_paste():
     assert prepare_composer_message("a\r\nb", bracketed_paste_mode=False) == "a\nb\r"
     assert prepare_composer_message("a\nb", bracketed_paste_mode=True) == "\x1b[200~a\rb\x1b[201~\r"
     assert prepare_composer_message("one", bracketed_paste_mode=True) == "one\r"
+    assert prepare_composer_message("início\nproblema\ncritério", bracketed_paste_mode=True).startswith("\x1b[200~")
+    assert prepare_composer_message("início\nproblema\ncritério", bracketed_paste_mode=True).endswith("\x1b[201~\r")
     assert prepare_composer_message("a\nb", bracketed_paste_mode=True, provider="powershell") == "a\nb\r"
 
 

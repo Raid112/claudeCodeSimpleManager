@@ -376,7 +376,7 @@ class PtyManager:
             raise PermissionError("PowerShell is not a conversational provider")
         try:
             prepared = prepare_composer_message(
-                text, bracketed_paste_mode=False, provider=session.terminal_type)
+                text, bracketed_paste_mode=True, provider=session.terminal_type)
         except InputProtocolError:
             raise
         with self.registry.lock_for(session_key):

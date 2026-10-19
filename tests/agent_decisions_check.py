@@ -200,6 +200,45 @@ def test_replan_attempts_are_bounded_and_parent_cannot_approve_child():
         root.cleanup()
 
 
+def test_list_pending_decisions_labels_awaiting_approval():
+    root = setup()
+    try:
+        p = proposal()
+        agent_decisions.create_proposal(p)
+        pending = agent_decisions.list_pending_decisions()
+        entry = next(d for d in pending if d["decision_id"] == p["decision_id"])
+        assert entry["pending_reason"] == "awaiting_approval"
+    finally:
+        root.cleanup()
+
+
+def test_list_pending_decisions_keeps_approved_prompt_visible_until_terminal_dispatch():
+    root = setup()
+    try:
+        p = proposal()
+        agent_decisions.create_proposal(p)
+        agent_decisions.approve(p["decision_id"], p["proposal_hash"], "local-user", "cap-dispatch")
+
+        # Approved with no execution at all yet (e.g. a pre-write failure recorded
+        # nothing) must still be retryable and visible, not silently gone.
+        pending = agent_decisions.list_pending_decisions()
+        entry = next(d for d in pending if d["decision_id"] == p["decision_id"])
+        assert entry["pending_reason"] == "awaiting_dispatch"
+
+        # ACCEPTED (mid-dispatch) is not a terminal execution state either.
+        agent_decisions.execute_approved(p["decision_id"], p["proposal_hash"], "dispatch-1")
+        still_pending = agent_decisions.list_pending_decisions()
+        assert any(d["decision_id"] == p["decision_id"] for d in still_pending)
+
+        # SENT is terminal: the decision must drop out of the pending list.
+        agent_decisions.append_execution_result(
+            p["decision_id"], {"request_id": "dispatch-1", "state": "SENT"})
+        done = agent_decisions.list_pending_decisions()
+        assert not any(d["decision_id"] == p["decision_id"] for d in done)
+    finally:
+        root.cleanup()
+
+
 if __name__ == "__main__":
     tests = [value for name, value in globals().items() if name.startswith("test_")]
     for test in tests:
