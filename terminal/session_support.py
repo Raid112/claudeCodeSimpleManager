@@ -17,8 +17,13 @@ def build_resume_command(
     continue_session: bool = False,
     hooks_path: str | None = None,
     resume_session: bool = True,
+    plugin_dir: str | None = None,
 ) -> str:
-    """Build the provider command used inside the PowerShell PTY."""
+    """Build the provider command used inside the PowerShell PTY.
+
+    `plugin_dir` loads the claudemanager-bridge mod with `--plugin-dir`: appending
+    to CLAUDE_CODE_PLUGIN_DIRS in the tab env does not work, because the `env` block
+    of ~/.claude/settings.json overrides it (plan spike S1)."""
     if terminal_type == "claude":
         if session_id:
             command = f"claude --resume {session_id}" if resume_session else f"claude --session-id {session_id}"
@@ -28,6 +33,8 @@ def build_resume_command(
             command = "claude"
         if hooks_path:
             command += f' --settings "{hooks_path}"'
+        if plugin_dir:
+            command += f' --plugin-dir "{plugin_dir}"'
         return command
     if terminal_type == "codex":
         command = "codex -c disable_paste_burst=true"

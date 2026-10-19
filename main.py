@@ -141,8 +141,30 @@ def main():
     except Exception:
         pass
 
+    # Claude Code mod (Docs/plans/2026-10-19-ClaudeManagerMod.md): with
+    # config.json -> claude_mod.enabled, claude tabs load mods/claudemanager-bridge
+    # and report state over a loopback endpoint instead of the --settings hooks.
+    # Any failure here leaves every tab on the hooks path.
+    mod_bridge, mod_dir, hello_timeout_s = None, None, 30.0
+    claude_mod = _load_config().get("claude_mod") or {}
+    if claude_mod.get("enabled"):
+        try:
+            from terminal.mod_bridge import ModBridgeServer
+            candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mods", "claudemanager-bridge")
+            if not os.path.isfile(os.path.join(candidate, ".claude-plugin", "plugin.json")):
+                raise FileNotFoundError(candidate)
+            hello_timeout_s = float(claude_mod.get("hello_timeout_s", 30))
+            mod_bridge = ModBridgeServer()
+            mod_bridge.start()
+            mod_dir = candidate.replace("\\", "/")
+            print(f"Claude mod bridge running at {mod_bridge.url}")
+        except Exception as exc:
+            print(f"Claude mod bridge unavailable; claude tabs use hooks: {exc}")
+            mod_bridge, mod_dir = None, None
+
     # Initialize PTY manager and WebSocket server
-    pty_manager = PtyManager(hooks_settings_path=hooks_settings_path)
+    pty_manager = PtyManager(hooks_settings_path=hooks_settings_path, mod_bridge=mod_bridge,
+                             mod_dir=mod_dir, hello_timeout_s=hello_timeout_s)
     ws_server = WebSocketServer(pty_manager, host="127.0.0.1", port=0)
     ws_server.start()
 
@@ -240,6 +262,11 @@ def main():
         except Exception:
             pass
         pty_manager.close_all()
+        if mod_bridge is not None:
+            try:
+                mod_bridge.stop()
+            except Exception:
+                pass
 
     window.events.closing += on_closing
 

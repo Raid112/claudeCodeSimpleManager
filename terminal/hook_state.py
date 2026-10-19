@@ -46,10 +46,14 @@ def _derive_status(event_name: str, prev_event: str | None) -> str | None:
 
     Returns None for events we don't track (keep prior state untouched).
     """
-    if event_name == "Stop":
+    if event_name in ("Stop", "StopFailure"):
         return "ready"
     if event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
         return "running"
+    if event_name == "PermissionAsk":
+        # Mod path only (terminal/mod_bridge.py): tool.check answered `ask`, so the
+        # permission dialog is open. Exact, unlike the Notification guess below.
+        return "tooluse"
     if event_name == "Notification":
         # Permission prompt arrives right after PreToolUse (no PostToolUse/Stop yet).
         # Idle-waiting arrives after Stop. Default to 'waiting' (safe: never blocks composer).
@@ -98,7 +102,8 @@ def _safe_log_event(session_id: str, event_name: str, tool_name: str | None, ts:
 
 def write_event(session_id: str, event_name: str, ts: float | None = None,
                 tool_name: str | None = None, tab_id: str | None = None,
-                session_key: str | None = None) -> None:
+                session_key: str | None = None, flags: dict | None = None,
+                apply_state: bool = True) -> None:
     """Persist derived status for a hook event. Must never raise (callers are hooks).
 
     State is keyed by `tab_id` (the managed tab, stable while the terminal lives)
@@ -107,12 +112,18 @@ def write_event(session_id: str, event_name: str, ts: float | None = None,
     backend can follow the switch (see PtyManager.get_all_sessions). Falls back to
     session_id keying for unmanaged sessions (no CLAUDEMANAGER_TAB env). `session_key`
     is the stable manager identity (CLAUDEMANAGER_SESSION_KEY); recorded as a field
-    so downstream consumers don't need to map tab_id -> session_key at read time."""
+    so downstream consumers don't need to map tab_id -> session_key at read time.
+
+    `flags` (mod path: `aborted`, `error`) ride along in the state file. With
+    `apply_state=False` the event is only logged: the mod bridge passes that for an
+    event older than one already applied, so a late delivery cannot move status back."""
     if not session_id or not event_name:
         return
     if ts is None:
         ts = time.time()
     _safe_log_event(session_id, event_name, tool_name, ts, session_key)
+    if not apply_state:
+        return
     key = tab_id or session_id
     prev = read_state(key)
     prev_event = prev.get("event") if prev else None
@@ -123,6 +134,9 @@ def write_event(session_id: str, event_name: str, ts: float | None = None,
         "event": event_name, "status": status, "ts": ts,
         "session_id": session_id, "session_key": session_key,
     }
+    for name, value in (flags or {}).items():
+        if value:
+            data[name] = True
     _atomic_write(state_path(key), json.dumps(data))
 
 

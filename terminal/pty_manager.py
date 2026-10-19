@@ -17,7 +17,8 @@ import winpty
 from pathlib import Path
 
 from terminal.input_debug import log_input_boundary
-from terminal.hook_state import delete_state, read_state
+from terminal.hook_state import delete_state, read_state, write_event
+from terminal.mod_bridge import TabModState
 from terminal.agent_contracts import (
     ACTION_SEND_PROMPT, EXECUTION_SENT, EXECUTION_UNKNOWN, STATUS_APPROVED, STATUS_EXPIRED,
 )
@@ -33,13 +34,21 @@ from terminal.session_support import (
 )
 
 
-def build_child_env(base: dict, tab_id: str, session_key: str) -> str:
+# Events the mod may report (mods/claudemanager-bridge translates native engine
+# events into this hook vocabulary; see plan section 4). Anything else is refused.
+MOD_EVENTS = frozenset({
+    "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "StopFailure",
+    "PermissionAsk", "SessionEnd",
+})
+
+
+def build_child_env(base: dict, tab_id: str, session_key: str, extra: dict | None = None) -> str:
     """Build the null-separated environment block pywinpty's `spawn(env=...)` expects.
 
     pywinpty's `env` replaces the *whole* child environment (it is not overlaid on
     the parent's), so callers must seed `base` from `dict(os.environ)` to keep
     everything the child normally inherits (PATH, SystemRoot, ...). Only the two
-    tab-identity vars are added on top. Windows also carries pseudo-variables whose
+    tab-identity vars (plus `extra`, the mod bridge's URL and token) are added on top. Windows also carries pseudo-variables whose
     NAME starts with `=` (e.g. `=C:`, `=ExitCode` — per-drive cwd tracking); these
     are not valid `name=value` pairs for CreateProcessW's env block and are dropped.
     Format per winpty.PTY.spawn's docstring: each `name=value` pair separated by a
@@ -48,6 +57,7 @@ def build_child_env(base: dict, tab_id: str, session_key: str) -> str:
     merged = dict(base)
     merged["CLAUDEMANAGER_TAB"] = tab_id
     merged["CLAUDEMANAGER_SESSION_KEY"] = session_key
+    merged.update(extra or {})
     entries = [f"{k}={v}" for k, v in merged.items() if not k.startswith("=")]
     return "\0".join(entries) + "\0"
 
@@ -97,6 +107,9 @@ class PtySession:
         session_key: str = None,
         resume: bool = False,
         hooks_settings_path: str = None,
+        mod_bridge=None,
+        mod_dir: str = None,
+        hello_timeout_s: float = 30.0,
     ):
         self.id = session_id
         self.group_name = group_name
@@ -106,6 +119,15 @@ class PtySession:
         self.agent_session_id = agent_session_id or claude_session_id
         self.session_key = session_key or str(uuid.uuid4())
         self.hooks_settings_path = hooks_settings_path
+        # "mod": the claudemanager-bridge mod reports state over mod_bridge and the
+        # --settings hooks are left out (both would double every event, plan D6).
+        # "hooks": the --hook-notify path. Per tab, so a tab whose mod never says
+        # hello can be restarted in hooks mode (plan D7).
+        self.mod_bridge = mod_bridge
+        self.mod_dir = mod_dir
+        self.hello_timeout_s = hello_timeout_s
+        self.mode = "mod" if (mod_bridge and mod_dir and terminal_type == "claude") else "hooks"
+        self.mod: TabModState | None = None
         # True only while restart() swaps the PTY: the ws reader polls is_alive between
         # reads, and the old process dying mid-swap must not close the tab's websocket.
         self._respawning = False
@@ -113,12 +135,23 @@ class PtySession:
 
     def _spawn(self, cols: int, rows: int, continue_session: bool, resume: bool):
         pty = winpty.PTY(cols, rows)
+        extra_env = None
+        if self.mode == "mod":
+            # A fresh token per process: issuing revokes the previous one, so a
+            # restarted tab's old process can no longer report.
+            token = self.mod_bridge.tokens.issue(self.id)
+            extra_env = {"CLAUDEMANAGER_BRIDGE_URL": self.mod_bridge.url,
+                         "CLAUDEMANAGER_BRIDGE_TOKEN": token}
+            self.mod = TabModState(self.hello_timeout_s)
+        else:
+            self.mod = None
         cmdline = build_resume_command(
             self.terminal_type,
             session_id=(self.claude_session_id if self.terminal_type == "claude" else self.agent_session_id),
             continue_session=continue_session,
-            hooks_path=self.hooks_settings_path,
+            hooks_path=None if self.mode == "mod" else self.hooks_settings_path,
             resume_session=resume,
+            plugin_dir=self.mod_dir if self.mode == "mod" else None,
         )
 
         # Tag the child env with this tab's id (and the stable session_key) so the
@@ -130,7 +163,7 @@ class PtySession:
         # ThreadingHTTPServer handler thread for agent_gateway-initiated ones), so
         # two concurrent creations mutating the same global os.environ would race
         # and cross-assign tab ids between sessions.
-        env_block = build_child_env(os.environ, self.id, self.session_key)
+        env_block = build_child_env(os.environ, self.id, self.session_key, extra_env)
         powershell_cmdline = build_powershell_command(cmdline)
         pty.spawn(
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
@@ -140,12 +173,17 @@ class PtySession:
         )
         return pty
 
-    def restart(self, cols: int, rows: int):
+    def restart(self, cols: int, rows: int, mode: str | None = None):
         """Kill the provider process and start it again under the SAME tab id and
         session_key, resuming the current conversation. For a CLI that got slow or
         stuck: the tab, its websocket and its work-item link all survive; only the
         process underneath is new. Kill before spawn so two claudes never write the
-        same session transcript at once."""
+        same session transcript at once. `mode="hooks"` drops the mod for this tab
+        (the "mod off" fallback); `mode="mod"` only applies to a claude tab with a
+        bridge."""
+        if mode == "hooks" or (mode == "mod" and self.mod_bridge and self.mod_dir
+                               and self.terminal_type == "claude"):
+            self.mode = mode
         self._respawning = True
         try:
             _kill_tree(self.pty)
@@ -207,9 +245,15 @@ class PtySession:
 class PtyManager:
     """Manages all PTY sessions."""
 
-    def __init__(self, hooks_settings_path: str = None):
+    def __init__(self, hooks_settings_path: str = None, mod_bridge=None, mod_dir: str = None,
+                 hello_timeout_s: float = 30.0):
         self.sessions: dict[str, PtySession] = {}
         self.hooks_settings_path = hooks_settings_path
+        self.mod_bridge = mod_bridge
+        self.mod_dir = mod_dir
+        self.hello_timeout_s = hello_timeout_s
+        if mod_bridge is not None:
+            mod_bridge.sink = self
         self.registry = SessionRegistry()
         # process_exited producer (Hermes plan Task 4): report-once set + its
         # own lock, guarding get_all_sessions() against double-emitting when
@@ -262,6 +306,9 @@ class PtyManager:
             session_key=session_key,
             resume=resume,
             hooks_settings_path=self.hooks_settings_path,
+            mod_bridge=self.mod_bridge,
+            mod_dir=self.mod_dir,
+            hello_timeout_s=self.hello_timeout_s,
         )
         self.sessions[session_id] = session
         self.registry.register(session)
@@ -304,13 +351,56 @@ class PtyManager:
     def get_session(self, session_id: str) -> PtySession | None:
         return self.sessions.get(session_id)
 
-    def restart_session(self, session_id: str, cols: int, rows: int) -> bool:
+    def restart_session(self, session_id: str, cols: int, rows: int, mode: str | None = None) -> bool:
         session = self.sessions.get(session_id)
         if session is None:
             return False
         with self.registry.lock_for(session.session_key):
-            session.restart(cols, rows)
+            session.restart(cols, rows, mode=mode)
         return True
+
+    # ---------- mod bridge sink (terminal/mod_bridge.py) ----------
+    def on_hello(self, tab_id: str, body: dict) -> None:
+        session = self.sessions.get(tab_id)
+        if session is None or session.mod is None:
+            return
+        session.mod.hello = {
+            "plugin_version": str(body.get("plugin_version") or "")[:40],
+            "engine_version": str(body.get("engine_version") or "")[:40],
+            "ts": time.time(),
+        }
+
+    def on_event(self, tab_id: str, body: dict) -> None:
+        session = self.sessions.get(tab_id)
+        if session is None or session.mod is None:
+            return
+        event = body.get("event")
+        session_id = body.get("session_id")
+        if event not in MOD_EVENTS or not isinstance(session_id, str) or not session_id:
+            raise ValueError("bad event")
+        tool = body.get("tool_name")
+        write_event(
+            session_id, event,
+            tool_name=tool if isinstance(tool, str) else None,
+            tab_id=session.id, session_key=session.session_key,
+            flags={"aborted": body.get("aborted") is True, "error": body.get("error") is True},
+            apply_state=session.mod.accept_seq(body.get("seq")),
+        )
+
+    def on_usage(self, tab_id: str, body: dict) -> None:
+        session = self.sessions.get(tab_id)
+        if session is None or session.mod is None:
+            return
+        context = body.get("context") if isinstance(body.get("context"), dict) else {}
+        limits = body.get("rateLimits") if isinstance(body.get("rateLimits"), list) else []
+        cost = body.get("cost") if isinstance(body.get("cost"), dict) else {}
+        session.mod.usage = {
+            "context": {k: context.get(k) for k in ("tokens", "window", "percent")},
+            "rate_limits": [{k: lim.get(k) for k in ("kind", "percentUsed", "resetsAt")}
+                            for lim in limits[:4] if isinstance(lim, dict)],
+            "cost_usd": cost.get("usd"),
+            "ts": time.time(),
+        }
 
     def close_session(self, session_id: str):
         session = self.sessions.get(session_id)
@@ -319,6 +409,8 @@ class PtyManager:
         try:
             self.sessions.pop(session_id, None)
             delete_state(session.id)  # state is keyed by tab id
+            if self.mod_bridge is not None:
+                self.mod_bridge.tokens.revoke(session.id)
             session.kill()
         finally:
             self.registry.finish_close(session.session_key)
@@ -484,6 +576,9 @@ class PtyManager:
                     "terminal_type": s.terminal_type,
                     "state": st.get("status") if st else None,
                     "state_ts": st.get("ts") if st else None,
+                    "state_flags": {k: True for k in ("aborted", "error") if st and st.get(k)},
+                    "mod_state": s.mod.state() if s.mod is not None else None,
+                    "usage": s.mod.usage if s.mod is not None else None,
                 }
             )
         return result

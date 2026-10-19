@@ -39,6 +39,8 @@ disk via work_items, nothing further to do):
 
     Stop                                -> task_completed / ready       (published)
     Notification, prev == PreToolUse    -> permission_requested/tooluse (published)
+    PermissionAsk (mod path)            -> permission_requested/tooluse (published)
+    StopFailure (mod path)              -> logged only
     Notification, prev == Stop          -> (status_changed/waiting)     logged only
     PROCESS_EXITED_EVENT                -> process_exited / exited      (published)
     UserPromptSubmit/PreToolUse/PostToolUse                             logged only
@@ -139,7 +141,7 @@ def normalize_event(record: dict, prev_event: str | None) -> dict | None:
         event_type = "task_completed"
         status = _derive_status(raw_event, prev_event)
         source = "claude_hook"
-    elif raw_event == "Notification" and prev_event == "PreToolUse":
+    elif raw_event == "PermissionAsk" or (raw_event == "Notification" and prev_event == "PreToolUse"):
         event_type = "permission_requested"
         status = _derive_status(raw_event, prev_event)
         source = "claude_hook"

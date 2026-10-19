@@ -324,9 +324,13 @@ class Bridge:
             "session_key": session.session_key,
         }
 
-    def restart_terminal(self, session_id: str, cols: int = 120, rows: int = 30) -> bool:
-        """Respawn a slow/stuck provider process in place (same tab, resumed session)."""
-        return self.pty_manager.restart_session(session_id, cols, rows)
+    def restart_terminal(self, session_id: str, cols: int = 120, rows: int = 30,
+                         mode: str | None = None) -> bool:
+        """Respawn a slow/stuck provider process in place (same tab, resumed session).
+        `mode="hooks"` is the "mod off" fallback: respawn without the Claude Code mod."""
+        if mode not in (None, "hooks", "mod"):
+            return False
+        return self.pty_manager.restart_session(session_id, cols, rows, mode=mode)
 
     def close_terminal(self, session_id: str):
         self.ws_server.revoke_session(session_id)
