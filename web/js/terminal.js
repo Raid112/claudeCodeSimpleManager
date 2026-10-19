@@ -125,6 +125,10 @@ class TerminalInstance {
         // Used to detect that claude resumed streaming after a 'waiting' state
         // without a new hook firing. null until the first hook event.
         this.backendStateTs = null;
+        // Claude Code mod state for this tab (get_terminals().mod_state): 'pending' |
+        // 'alive' | 'missing', or null for a tab on the hooks path. With 'alive' the
+        // mod reports exact events (Docs/plans/2026-10-19-ClaudeManagerMod.md).
+        this.modState = null;
 
         // Explicit follow-mode state. true = output rolls to bottom; false = user is reading scrollback.
         // autoFollow ONLY changes on a real user scroll (wheel). write/resize/scrollback-trim all
@@ -415,6 +419,11 @@ class TerminalInstance {
         if (!this.alive || (this._sawDisconnect && !this._wsConnected)) return 'stopped';
 
         const idleMs = Date.now() - this.lastOutputTime;
+        if (this.backendState && this.modState === 'alive') {
+            // The mod reports every turn start (prompt typed in the terminal included),
+            // so its state needs none of the output-based corrections below.
+            return this.backendState;
+        }
         if (this.backendState) {
             // 'waiting' = claude idle waiting for input. If it resumed via an
             // in-terminal reply (no UserPromptSubmit hook), it streams output
@@ -563,15 +572,15 @@ class TerminalInstance {
     /** Kill and respawn the provider process under this same tab, resuming the session.
      * For a CLI that got slow or stuck (repaint can't help: the bottleneck is the process).
      * The websocket stays open — the backend swaps the PTY underneath it. */
-    async restart() {
+    async restart(mode = null) {
         if (!(window.pywebview && window.pywebview.api && window.pywebview.api.restart_terminal)) return false;
         this.fit();
         const { cols, rows } = this.term;
         // Wipe before the new process starts printing, so its resume redraw lands on a clean screen.
         this.term.reset();
         this.backendState = null;
-        const ok = await window.pywebview.api.restart_terminal(this.sessionId, cols, rows);
-        if (typeof UiLog !== 'undefined') UiLog.push('tab.restart', { session: this.sessionId, cols, rows, ok: !!ok });
+        const ok = await window.pywebview.api.restart_terminal(this.sessionId, cols, rows, mode);
+        if (typeof UiLog !== 'undefined') UiLog.push('tab.restart', { session: this.sessionId, cols, rows, mode, ok: !!ok });
         this.term.focus();
         return !!ok;
     }

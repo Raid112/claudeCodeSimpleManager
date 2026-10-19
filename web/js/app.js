@@ -394,6 +394,7 @@ class App {
             const instance = new TerminalInstance(sessionId, this.wsPort, wrapper, capability);
             instance.backendState = serverData.state || null;
             instance.backendStateTs = serverData.state_ts ? serverData.state_ts * 1000 : null;
+            instance.modState = serverData.mod_state || null;
             this.terminals[sessionId] = {
                 instance,
                 groupName: serverData.group_name,
@@ -454,6 +455,7 @@ class App {
                 // Authoritative hook state (claude only; null otherwise).
                 info.instance.backendState = serverData.state || null;
                 info.instance.backendStateTs = serverData.state_ts ? serverData.state_ts * 1000 : null;
+                info.instance.modState = serverData.mod_state || null;
                 this._maybePlayStateSound(id, info.instance, serverData.state, serverData.state_ts);
             }
         }

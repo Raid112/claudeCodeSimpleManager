@@ -675,6 +675,16 @@ body.col-resizing {
 .tab:hover .tab-restart, .tab.active .tab-restart { opacity: 1; }
 .tab .tab-repaint:hover { color: var(--text); }
 .tab .tab-restart:hover { color: var(--red, #ef4444); }
+.tab .tab-modoff {
+    font-size: 10px;
+    color: var(--yellow, #eab308);
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    padding: 0 3px;
+    line-height: 14px;
+    cursor: pointer;
+    white-space: nowrap;
+}
 
 /* Rename inputs */
 .tab-rename-input,

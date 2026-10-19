@@ -113,6 +113,9 @@ class TabBar {
                 html += `<span class="tab-label" data-id="${id}">${keyPrefix}${this._esc(labelName)}</span>`;
                 html += timerHtml;
                 html += linkHtml;
+                if (info.instance && info.instance.modState === 'missing') {
+                    html += `<span class="tab-modoff" data-id="${id}" title="O mod do ClaudeManager não respondeu nesta aba; o status volta pra heurística. Clique pra reiniciar em modo hooks.">mod off</span>`;
+                }
                 html += `<span class="tab-repaint" data-id="${id}" title="Redesenhar terminal (layout quebrado)">⟳</span>`;
                 html += `<span class="tab-restart" data-id="${id}" title="Reiniciar processo (lento/travado): mata e retoma a mesma sessão">⏻</span>`;
                 html += `<span class="tab-close" data-id="${id}" title="Fechar">×</span>`;
@@ -222,6 +225,18 @@ class TabBar {
                 const entry = this.app.terminals && this.app.terminals[el.dataset.id];
                 const inst = entry && entry.instance;
                 if (inst && typeof inst.repaint === 'function') inst.repaint();
+            });
+        });
+
+        // "mod off" badge -> respawn this tab on the --settings hooks path (plan D7)
+        this.container.querySelectorAll('.tab-modoff').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const entry = this.app.terminals && this.app.terminals[el.dataset.id];
+                const inst = entry && entry.instance;
+                if (!inst || typeof inst.restart !== 'function') return;
+                if (!confirm('Reiniciar esta aba em modo hooks (sem o mod)? A conversa é retomada.')) return;
+                inst.restart('hooks');
             });
         });
 
