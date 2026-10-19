@@ -88,8 +88,9 @@ python tests/ui_log_check.py
 
 Plano: `Docs/plans/2026-10-19-ClaudeManagerMod.md`. Abas claude passam a carregar um mod do Claude Code que fala com o manager de dentro da sessão (estado exato, prompt sem PTY, aprovação de tool pela UI, uso por aba), no lugar dos hooks `--settings` + heurística de output.
 
-- **O mod mora neste repo:** `mods/claudemanager-bridge/` (decidido; não criar em `~/.claude/dev-mods` nem em `clones/.claude/mods`). O `pty_manager` aponta pra ele fazendo append em `CLAUDE_CODE_PLUGIN_DIRS` no env da aba, sem sobrescrever o valor do pai (o usuário já carrega o `harness-band` por ali).
+- **O mod mora neste repo:** `mods/claudemanager-bridge/` (decidido; não criar em `~/.claude/dev-mods` nem em `clones/.claude/mods`). O `pty_manager` carrega ele com `--plugin-dir` no comando da aba. Append em `CLAUDE_CODE_PLUGIN_DIRS` no env **não funciona**: o `env` do `~/.claude/settings.json` sobrescreve (spike S1).
 - **Lado manager:** `terminal/mod_bridge.py` (HTTP loopback com token por aba). Separado do `agent_gateway`: Hermes nunca aprova tool.
 - **Exclusivo:** aba em modo mod sobe sem o `--settings` do manager (os dois juntos duplicam eventos). Flag `config.json` → `claude_mod.enabled`; desligada = caminho atual.
 - **API de mods muda por build:** referência 2.1.303; tipos fixados em `mods/claudemanager-bridge/.claude-plugin/types/`. Gates do mod: `claude plugin validate`, `tsc -p`, `claude plugin test`.
+- **Só eventos nativos** (`turn.*`, `tool.call`, `tool.check`, `session.*`): hooks `classic.*` não disparam nesta instalação (Claude Code gerenciado pela organização). Tradução pro vocabulário do `hook_state` na seção 4 do plano.
 - Codex/opencode/powershell não mudam (seguem PTY + heurística).

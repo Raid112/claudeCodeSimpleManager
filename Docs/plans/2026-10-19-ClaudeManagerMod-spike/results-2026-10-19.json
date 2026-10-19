@@ -1,0 +1,147 @@
+{
+  "S1.env.hello": false,
+  "S1.flag.hello_after_s": 8.43,
+  "S2.hello": {
+    "tab": "spike01",
+    "dirs": "C:/Users/caioc/clones/.claude/mods/harness-band",
+    "version": {
+      "version": "2.1.303",
+      "base": "2.1.303",
+      "builtAt": "2026-10-18T20:20:57Z"
+    },
+    "session_id": "89584e77-0624-4c75-8d92-56d6bed1c058",
+    "isInteractive": true,
+    "surface": "terminal",
+    "_token": "spike"
+  },
+  "S1.harness_band_visible": true,
+  "S3.plain": {
+    "stop": true,
+    "sequence": [
+      "turn.start",
+      "prompt.submit",
+      "turn.complete"
+    ],
+    "answer": "PONG"
+  },
+  "S4.hold-none": {
+    "dialog_visible_during_hold": false,
+    "dialog_after_hold": true,
+    "hook_logs": [
+      {
+        "what": "permission.answer",
+        "answer": {
+          "behavior": null
+        },
+        "afterMs": 8020,
+        "aborted": false
+      }
+    ],
+    "file_created": false,
+    "post": [],
+    "turn_reason": "answer"
+  },
+  "S4.hold-allow": {
+    "dialog_visible_during_hold": true,
+    "dialog_after_hold": false,
+    "hook_logs": [
+      {
+        "what": "permission.answer",
+        "answer": {
+          "behavior": "allow"
+        },
+        "afterMs": 6004,
+        "aborted": false
+      }
+    ],
+    "file_created": true,
+    "post": {
+      "isError": null,
+      "deny": null,
+      "ms": 9231
+    },
+    "turn_reason": "answer"
+  },
+  "S4.hold-deny": {
+    "dialog_visible_during_hold": false,
+    "dialog_after_hold": false,
+    "hook_logs": [
+      {
+        "what": "permission.answer",
+        "answer": {
+          "behavior": "deny"
+        },
+        "afterMs": 4005,
+        "aborted": false
+      }
+    ],
+    "file_created": false,
+    "post": {
+      "isError": true,
+      "deny": null,
+      "ms": 4279
+    },
+    "turn_reason": "answer"
+  },
+  "S4.esc-during-hold": {
+    "dialog_visible_during_hold": false,
+    "dialog_after_hold": false,
+    "hook_logs": [
+      {
+        "what": "permission.aborted",
+        "answer": null,
+        "afterMs": 3167,
+        "aborted": null
+      }
+    ],
+    "file_created": false,
+    "post": [],
+    "turn_reason": "aborted"
+  },
+  "S6.idle": {
+    "ack": {
+      "state": "started",
+      "ms": 4,
+      "err": null
+    },
+    "prompt_identical": false,
+    "origin": [],
+    "answer": null
+  },
+  "S6.busy": {
+    "first_done_rt": 214.0,
+    "p2_started_rt": 215.04,
+    "p2_ack_ms": 2013,
+    "queued_until_idle": true,
+    "second_answer": "SEGUNDO"
+  },
+  "S6.big_identical": false,
+  "S3.clear": {
+    "session_start_again": false,
+    "new_session_id": [],
+    "sid_before": "89584e77-0624-4c75-8d92-56d6bed1c058",
+    "events": [
+      [
+        "session.end",
+        null,
+        null
+      ]
+    ]
+  },
+  "S3.after_clear_session_id": "2972924e-4168-4d8c-bd37-b5b5329ae41a",
+  "S5.ticks": {
+    "count": 6,
+    "max_wait_ms": 20018,
+    "errors": 0
+  },
+  "S5.refusal_lines": [],
+  "S7.usage_count": {
+    "turn.complete": 9,
+    "session.measure": 10
+  },
+  "S1.resume": {
+    "hello_after_s": null,
+    "session_id": null,
+    "expected": "89584e77-0624-4c75-8d92-56d6bed1c058"
+  }
+}

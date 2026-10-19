@@ -10,7 +10,9 @@
 
 ## 0. Pré-requisito: fronteira de commit
 
-O working tree tem 36 arquivos modificados (+4.4k linhas, trabalho Hermes em andamento) justo em `pty_manager.py`, `bridge.py`, `app.js`, `terminal.js`, `hook_state.py`, `work_items.py`. Nada deste plano começa antes desse trabalho ser commitado (ou ir pra branch própria). Depois disso: branch `feat/claude-mod` a partir do HEAD.
+Feito em 2026-10-19: o WIP virou 11 commits (`6e1db18`..`b4e8cbd`). Implementação em branch `feat/claude-mod` a partir do HEAD.
+
+> **Revisão pós-spike (2026-10-19):** D5, D6, D7, D9 e as seções 4, 6 e 7 foram reescritas com os resultados da seção 8. O que mudou: os hooks `classic.*` **não disparam nesta instalação** (Claude Code gerenciado pela organização), então o mod usa só eventos nativos. O mod carrega por `--plugin-dir`, e o env não serve. O diálogo de permissão só aparece depois que o `tool.check` resolve. Prompt de plugin aparece rotulado pro modelo e é descartado depois de um Esc.
 
 ---
 
@@ -22,11 +24,11 @@ O working tree tem 36 arquivos modificados (+4.4k linhas, trabalho Hermes em and
 | D2 | Auth: token por aba, emitido no spawn, mandado no header `X-CM-Tab-Token`. A aba vem do token, nunca do body | Outro processo local não consegue falsificar outra aba. Mesmo modelo do `WsCapabilityStore`. Não usar `init.auth`: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` recusa request de plugin com `auth` | Token global (uma aba poderia escrever o estado de outra) |
 | D3 | Manager → mod por inbox que o mod puxa (`GET /v1/inbox?wait=20`, long-poll), num loop iniciado no `session.start` | O mod não escuta porta. Um `$` em voo não conta no budget de 10s, então o long-poll é barato (confirmar no S5) | Poll de 1s (fallback se o S5 falhar) |
 | D4 | Identidade via `$.env.get("CLAUDEMANAGER_TAB")`, `CLAUDEMANAGER_SESSION_KEY`, `CLAUDEMANAGER_BRIDGE_URL`, `CLAUDEMANAGER_BRIDGE_TOKEN`, todos injetados por `build_child_env`. Sem essas vars, o mod não faz nada | Sessão claude fora do manager não pode ser afetada | |
-| D5 | Carregamento: `build_child_env` faz **append** da pasta do mod em `CLAUDE_CODE_PLUGIN_DIRS` (separador `;` no Windows), preservando o valor do pai | O env do pai já tem `C:/Users/caioc/clones/.claude/mods/harness-band`; sobrescrever mata a banda nas abas | `--plugin-dir` no cmdline (funciona, mas não compõe com o env do usuário) |
-| D6 | Aba claude em modo mod sobe **sem** o `--settings` do manager. Exclusivo: ou mod, ou hooks | `classic.*` dispara no mod com ou sem settings hook, então rodar os dois duplica cada evento (event log duplicado, Hermes publica `task_completed` duas vezes). Engolir o hook classic sem `next` também não serve: mataria os hooks globais do usuário em `~/.claude/settings.json`, que rodam como "core" na mesma chain | Manter os dois e deduplicar (frágil) |
-| D7 | Fallback por aba: sem `hello` em `claude_mod.hello_timeout_s` (default 15s, ajustado pelo tempo medido no S1 com `--resume` de transcript grande) após o spawn, a aba fica `mod_state: "missing"`, o status volta pra heurística de output e a UI mostra o badge "mod off" com o botão "reiniciar em modo hooks" (`restart_session` com `--settings`) | Build nova pode quebrar o mod. A aba não pode ficar cega | |
+| D5 | Carregamento: `build_resume_command` adiciona `--plugin-dir "<repo>/mods/claudemanager-bridge"` no comando da aba claude | S1: o `CLAUDE_CODE_PLUGIN_DIRS` do usuário vem do bloco `env` do `~/.claude/settings.json`, que sobrescreve o valor passado no env do PTY (o mod não carregou). Com `--plugin-dir`, o mod carrega e o harness-band continua | Append em `CLAUDE_CODE_PLUGIN_DIRS` no env (refutado no S1) |
+| D6 | Aba claude em modo mod sobe **sem** o `--settings` do manager. Exclusivo: ou mod, ou hooks | Os command hooks do `--settings` rodam (são hooks de settings, não de plugin), então rodar os dois duplica cada evento (event log duplicado, Hermes publica `task_completed` duas vezes) | Manter os dois e deduplicar (frágil) |
+| D7 | Fallback por aba: sem `hello` em `claude_mod.hello_timeout_s` (default 30s; S1 mediu 8.4s em sessão nova, `--resume` não foi medido) após o spawn, a aba fica `mod_state: "missing"`, o status volta pra heurística de output e a UI mostra o badge "mod off" com o botão "reiniciar em modo hooks" (`restart_session` com `--settings`) | Build nova pode quebrar o mod. A aba não pode ficar cega | |
 | D8 | Flag global `config.json` → `"claude_mod": {"enabled": false}`. Começa desligada, liga depois dos spikes. Desligada = caminho atual intacto | Rollback = mudar a flag | |
-| D9 | O mod repassa os eventos com o **mesmo vocabulário** do `--hook-notify` (`{event, session_id, tool_name, ts}`), e o manager chama o mesmo `hook_state.write_event` | `_derive_status`, `work_items.log_event` e `hermes_events.normalize_event` continuam funcionando. Só entram eventos novos | Vocabulário novo (reescreve 3 consumidores) |
+| D9 | O mod **traduz eventos nativos** pro vocabulário do `--hook-notify` (`{event, session_id, tool_name, ts}`), e o manager chama o mesmo `hook_state.write_event`. Tabela na seção 4 | S3: `classic.*` nunca dispara aqui (o validate avisa: em instalação gerenciada pela org, esses eventos pulam plugins do usuário). `_derive_status`, `work_items.log_event` e `hermes_events.normalize_event` seguem iguais | Hooks `classic.*` (refutado no S3); vocabulário novo (reescreve 3 consumidores) |
 | D10 | Mod mora no repo: `ClaudeManager/mods/claudemanager-bridge/` | `pty_manager` aponta pra ele; versiona junto com o protocolo | `~/.claude/dev-mods` (sessão), `clones/.claude/mods` (outro repo) |
 | D11 | Falha do mod é sempre fail-open: erro de fetch ou manager fora → `next(e)`, comportamento padrão do Claude Code. Nunca `deny` por erro | Manager caído não pode negar todas as tools | `.catch(() => ({decision:"deny"}))` da doc (serve pra guard de segurança, não pra conveniência) |
 | D12 | Aprovação só por clique humano via `Bridge` (pywebview JS API). Nenhuma rota do `agent_gateway` toca permissão | Invariante de segurança: Hermes propõe prompt, nunca aprova tool | |
@@ -70,13 +72,13 @@ Saída da fase: seção 8 preenchida + decisão do item 3. **Gate:** sem S1, S2 
 - Testes: `tests/mod_bridge_check.py` (token errado → 401, token da aba A não escreve na aba B, `seq` duplicado ignorado, long-poll devolve item que chega no meio da espera, body grande → 413).
 
 ### T1.2 Spawn
-- `build_child_env(base, tab_id, session_key, bridge=None)`: com `bridge`, adiciona `CLAUDEMANAGER_BRIDGE_URL`, `CLAUDEMANAGER_BRIDGE_TOKEN` e faz append de `MOD_DIR` em `CLAUDE_CODE_PLUGIN_DIRS` (`;`, sem duplicar).
-- `build_resume_command`: em modo mod, `hooks_path=None` (D6).
+- `build_child_env(base, tab_id, session_key, bridge=None)`: com `bridge`, adiciona `CLAUDEMANAGER_BRIDGE_URL` e `CLAUDEMANAGER_BRIDGE_TOKEN`. Não mexe em `CLAUDE_CODE_PLUGIN_DIRS` (D5).
+- `build_resume_command(..., mod_dir=None)`: em modo mod, `--plugin-dir "<mod_dir>"` e `hooks_path=None` (D6).
 - `PtySession.restart`: re-emite o token (processo novo, env novo) e revoga o anterior. `close_session` revoga.
 - `PtySession.mode ∈ {"mod", "hooks"}` por aba: hoje o `restart` reusa `self.hooks_settings_path` sempre. Com o modo por aba, o "reiniciar em modo hooks" do D7 é `restart(mode="hooks")`.
-- `PtyManager`: `mod_state` por aba (`pending` no spawn → `alive` no hello → `missing` depois de 15s); entra no `get_all_sessions` como `mod_state`.
+- `PtyManager`: `mod_state` por aba (`pending` no spawn → `alive` no hello → `missing` depois de `hello_timeout_s`); entra no `get_all_sessions` como `mod_state`.
 - `main.py`: sobe o `ModBridgeServer` antes do `PtyManager` quando `claude_mod.enabled`; se falhar ao subir, segue no modo hooks e loga.
-- Testes: atualizar `tests/pty_env_check.py` (vars novas, append preserva valor do pai, sem bridge = env igual ao de hoje), `tests/session_support_check.py` (sem `--settings` em modo mod), `tests/pty_manager_check.py` (transições do `mod_state`, revoke no restart/close).
+- Testes: atualizar `tests/pty_env_check.py` (vars novas, sem bridge = env igual ao de hoje), `tests/session_support_check.py` (`--plugin-dir` e sem `--settings` em modo mod), `tests/pty_manager_check.py` (transições do `mod_state`, revoke no restart/close).
 
 ### T1.3 Esqueleto do mod `mods/claudemanager-bridge/`
 - `.claude-plugin/plugin.json`, `hooks/hooks.json`, `hooks/register.ts`, `hooks/client.ts` (fetch com header, timeout 2s, fila serial com `seq`, erro engolido = fail-open), `types/index.d.ts` (`PluginState['claudemanager-bridge']`: `seq`, `submitted: string[]`).
@@ -87,103 +89,123 @@ Saída da fase: seção 8 preenchida + decisão do item 3. **Gate:** sem S1, S2 
 
 ## 4. Fase 2: item 1 (estado exato)
 
-### T2.1 Mod
-Hooks em `classic.UserPromptSubmit`, `classic.PreToolUse`, `classic.PostToolUse`, `classic.Stop`, `classic.StopFailure`, `classic.Notification`, `classic.PermissionRequest`, `classic.SessionStart`. Cada um faz `await next(e)` primeiro (não altera o comportamento), depois `POST /v1/event`. Sem input de tool nem texto de prompt no payload (mantém a regra de privacidade do `log_event`).
+### T2.1 Mod: tradução de eventos nativos (D9)
+Cada hook faz `await next(e)` primeiro (não altera o comportamento) e depois `POST /v1/event`. Payload sem input de tool nem texto de prompt (mantém a regra de privacidade do `log_event`). Ordem observada no S3: `turn.start` → `prompt.submit` resolve → `tool.check` → `tool.call` → `turn.complete`.
+
+| Evento nativo | Vira (`event` no POST) | Observação |
+|---|---|---|
+| `turn.start` sem `agentId` | `UserPromptSubmit` | Também cobre turno iniciado por `$.prompt.submit` (que o `prompt.submit` do próprio plugin não vê, por causa da regra de re-entrada) |
+| `tool.call` antes do `next` | `PreToolUse` (+ `tool_use_id`, `agentId`) | |
+| `tool.call` depois do `next` | `PostToolUse` | `isError` / `deny` vão junto |
+| `tool.check` com veredito `ask` | `PermissionAsk` (novo) | No modo `default`, `ask` = o diálogo abre assim que o hook devolve (S4). No modo `auto`, o `ask` vai pro classificador: não testado (ver S4b) |
+| `turn.complete` sem `agentId`, `reason: answer` | `Stop` | |
+| `turn.complete`, `reason: aborted` | `Stop` + `aborted: true` | Esc do usuário |
+| `turn.complete`, `reason: error \| refusal` | `StopFailure` (novo) | Hoje a aba fica presa em `running` |
+| `session.end` | `SessionEnd` (novo) | No `/clear` o `session.start` **não** dispara de novo; só vem `session.end` (S3) |
+| troca de `$.session.id()` | campo `session_id` de todo POST | Depois do `/clear`, o id novo aparece no turno seguinte (S3). O mod checa `$.session.id()` em cada `turn.start` e manda junto |
+
+Não há equivalente de `Notification(idle_prompt)` (`waiting`). O manager deriva `waiting` de `ready` + N segundos sem input, se quiser manter.
 
 ### T2.2 `hook_state._derive_status`
 | Evento | Hoje | Novo |
 |---|---|---|
-| `PermissionRequest` | não existe | `tooluse` (exato) |
-| `Notification` com `notification_type` | ambíguo, decidido pelo evento anterior | `permission_prompt` → `tooluse`; `idle_prompt` → `waiting`; outro → regra antiga |
-| `StopFailure` | não existe (aba presa em `running` quando a API falha) | `ready` + `error: true` no state |
-| `SessionStart` | ignorado | `startup`/`clear`/`resume`/`fork` → `ready` + `source` (o `session_id` novo já entra no state e o `get_all_sessions` segue a troca; `fork` também troca o id). `compact` → `None` (dispara no meio do turno; mudar pra `ready` deixaria idle uma aba ocupada) |
+| `PermissionAsk` | não existe | `tooluse` (exato no modo default) |
+| `Stop` com `aborted` | `ready` | `ready` + `aborted: true` no state (o composer avisa: prompt de plugin vai ser descartado, ver S6) |
+| `StopFailure` | não existe | `ready` + `error: true` |
+| `SessionEnd` | não existe | sem mudança de status; marca `session_ending` pro `get_all_sessions` esperar o id novo |
 
-`write_event` ganha `notification_type`, `source`, `agent_id` e `error` opcionais. O caminho `--hook-notify` não muda (não manda esses campos e cai na regra antiga).
+`write_event` ganha `aborted`, `error`, `agent_id` opcionais. O caminho `--hook-notify` não muda.
 
 ### T2.3 `work_items.log_event` + `hermes_events.normalize_event`
-- O log grava `notification_type` (metadado, sem texto).
-- `PermissionRequest` → `permission_requested`. `Notification(permission_prompt)` com evento anterior `PermissionRequest` → só log, sem publicar (senão publica duas vezes). `StopFailure` → `task_failed` (evento novo, publicado) ou só log: decidir com o contrato do Hermes, e o default é só log.
+- `PermissionAsk` → `permission_requested`. No modo mod não existe `Notification`, então não há publicação dupla.
+- `StopFailure` → só log por default (`task_failed` publicado depende de combinar o contrato com o Hermes).
+- `Stop` com `aborted` → `task_completed` com `aborted: true` (o Hermes precisa saber que o usuário interrompeu, e que prompt automático vai cair, ver T4.3).
 
 ### T2.4 Frontend
 - `terminal.js status`: com `mod_state === "alive"`, o `backendState` vale sozinho (sem o desvio "waiting + output recente = running", que era remendo da ambiguidade). Badge "mod off" quando `missing`.
 - `CLAUDE.md`: atualizar as seções 3, 5 e 6, a linha "State flow" e adicionar `mod_bridge.py` + `mods/claudemanager-bridge/`.
-- Testes: `tests/hook_state_check.py` (tabela acima, `compact` sem mudança de status), `tests/hermes_events_check.py` (sem publicação dupla), teste do mod que cobre cada `classic.*` virando o POST esperado.
+- Testes: `tests/hook_state_check.py` (tabela acima), `tests/hermes_events_check.py`, e teste do mod cobrindo cada linha da tabela T2.1 (o `claude plugin test` levanta `turn.*`/`tool.*` e responde o `http.fetch` por baixo do plugin).
 
 ---
 
 ## 5. Fase 3: item 4 (uso por aba)
 
-- Mod: `POST /v1/usage` no `turn.complete` e no `session.measure`, com throttle de 1 por 5s. `$.session.usage()` sem args é grátis.
+- Mod: `POST /v1/usage` no `turn.complete` e no `session.measure`, com throttle de 1 por 5s (o S7 viu 10 `session.measure` numa sessão curta). `$.session.usage()` sem args é grátis.
+- Shape real (S7): `{ startedAt, context: { tokens, window, percent }, rateLimits: [{ kind: "five_hour" | "seven_day", percentUsed, resetsAt }], cost: { usd } }`.
 - Manager: `get_all_sessions` inclui `usage`. UI: badge de contexto na aba (verde < 60%, amarelo < 85%, vermelho acima), tooltip com custo. Barra global com 5h/semana (o rate limit é da conta, então vale o mais recente entre as abas).
 - O `cacheRemainingMs` do `terminal.js` passa a contar do `ts` real do último `UserPromptSubmit` em vez do envio pelo composer (pega prompt digitado direto no terminal).
-- Testes: shape do payload com `rateLimits` vazio (fora de assinatura) e sem `cost`.
+- Testes: payload com `rateLimits` vazio (fora de assinatura) e sem `cost`.
 
 ---
 
 ## 6. Fase 4: item 2 (prompt sem PTY)
 
 ### T4.1 Inbox no manager
-- `PromptInbox` por aba: item `{id, kind: "prompt", text, source: "composer" | "hermes", request_id?, decision_id?}`. Estados: `queued` → `claimed` (mod pegou) → `started` (o `$.prompt.submit` resolveu = turno começou) | `failed`.
+- `PromptInbox` por aba: item `{id, kind: "prompt", text, source: "hermes", request_id?, decision_id?}`. Estados: `queued` → `claimed` (mod pegou) → `started` (o `$.prompt.submit` resolveu = turno começou) | `dropped` (motivo do engine) | `failed`.
 - Re-entrega: nunca automática. `claimed` sem `started` depois de 120s → `unknown` (mesma semântica do `EXECUTION_UNKNOWN` de hoje).
 
 ### T4.2 Mod
-- O loop do inbox, para cada item: grava `id` em `$.state.submitted` (session-scope, sobrevive ao reload), manda `ack claimed` e agenda o submit num dispatch próprio (`$.clock.after(0, ...)`), que faz `await $.prompt.submit({ text })` e manda `ack started`. O loop nunca espera o submit: numa sessão ocupada ele só resolve quando o turno começa (minutos) e travaria o inbox inteiro, decisões de permissão incluídas. Um `id` que já está em `submitted` recebe só o ack e não é reenviado (cobre perda do worker).
+- O loop do inbox, para cada item: grava `id` em `$.state.submitted` (session-scope, sobrevive ao reload), manda `ack claimed` e agenda o submit num dispatch próprio (`$.clock.after(0, ...)`), que faz `await $.prompt.submit({ text })`. Resultado com `drop` → `ack dropped` + motivo; senão `ack started`. O loop nunca espera o submit (S6: numa sessão ocupada ele só resolve quando o turno começa). Um `id` que já está em `submitted` recebe só o ack e não é reenviado.
 
-### T4.3 Quem usa
-- **Composer** (`composer.js _send`): aba claude com `mod_state === "alive"` e texto que não começa com `/` → `Bridge.submit_prompt(tab_id, text)`. Slash command e abas sem mod seguem no PTY. O bloqueio `tooluse` vira estado visível "na fila (1)": o prompt espera o turno livre, nunca entra no meio de um turno rodando. **Muda o comportamento:** hoje, digitar com a aba ocupada cai na fila de input da CLI.
-- **Hermes** (`pty_manager.send_prompt` / `send_owned_prompt`): aba claude com mod → enfileira no inbox em vez do `session.write`. O recibo `EXECUTION_SENT` passa a significar "mod aceitou", e `started` adiciona `provider_processed: true` (hoje é sempre `false`). Ganho real: o Hermes passa a saber que o turno começou. A idempotência do `agent_decisions` não muda: `request_id` = `id` do item.
-- **Origin:** depende do S6. Se o modelo lê "plugin claudemanager", o Hermes mantém (é proveniência), e o composer vai pro fallback `$.prompt.fill` + `\r` (texto exato na caixa, Enter via PTY).
-- `prepare_composer_message` / bracketed paste continuam só pra codex/opencode e pro fallback.
+### T4.3 Quem usa (revisto pelo S6)
+- **Hermes** (`pty_manager.send_prompt` / `send_owned_prompt`): aba claude com mod → inbox em vez do `session.write`. Ganhos medidos: o texto chega inteiro (multi-linha, unicode, 20KB), espera o turno livre, e `started` dá ao Hermes `provider_processed: true` (hoje é sempre `false`). O modelo lê o prompt embrulhado como "The claudemanager-bridge plugin sent a message: … " (~180 chars de wrapper): pro Hermes isso é proveniência e fica. **Depois de um Esc, o engine descarta prompt de plugin** (`{drop: "the session was stopped and nobody has sent input since"}`) até a pessoa digitar. O recibo vira `dropped`, sem fallback pro PTY: o usuário interrompeu e o Hermes não deve furar isso.
+- **Composer: continua no PTY.** Motivos do S6: o modelo leria a mensagem do usuário como vinda de um plugin, e ela seria descartada depois de qualquer Esc. Melhoria opcional: `$.prompt.fill` (texto exato na caixa) + `\r` via PTY, no lugar do bracketed paste.
+- `prepare_composer_message` / bracketed paste continuam pro composer e pra codex/opencode.
 
 ### T4.4 Testes
-`tests/prompt_inbox_check.py` (estados, sem re-entrega, timeout → unknown), `tests/approval_flow_check.py` (send_prompt via inbox mantém hash e idempotência), teste do mod (item duplicado não submete duas vezes, falha do submit → `ack failed`), `tests/terminal-input.test.js` intacto.
+`tests/prompt_inbox_check.py` (estados, `dropped`, sem re-entrega, timeout → unknown), `tests/approval_flow_check.py` (send_prompt via inbox mantém hash e idempotência), teste do mod (item duplicado não submete duas vezes, `drop` vira `ack dropped`).
 
 ---
 
-## 7. Fase 5: item 3 (aprovar tool pela UI)
+## 7. Fase 5: item 3 (aprovar tool pela UI) (revisto pelo S4)
 
-Restrição dura: budget de 10s por dispatch. Um `$` em voo não conta, mas o que manda é o que o S4 mostrar sobre o diálogo.
+Fatos do S4 (modo default):
+- O diálogo do terminal **só aparece depois** que o `tool.check` resolve. Enquanto o hook espera, o terminal mostra só o spinner (a variante A, corrida, está descartada).
+- O hook pode decidir: `allow` roda a tool sem diálogo; `deny` vira erro pro modelo e o turno continua.
+- Esc durante a espera aborta o hook (`next.signal`) e **o turno inteiro** (`reason: aborted`), não só a tool.
+- Esperar 8 a 20s num `$.http.fetch` não estourou o budget.
 
-| Variante | Como | Quando usar |
+| Variante | Como | Custo |
 |---|---|---|
-| **A: corrida** | `classic.PermissionRequest` faz long-poll em `/v1/permission`. O diálogo do terminal aparece ao mesmo tempo, e quem responder primeiro ganha; resposta no terminal aborta o hook via `next.signal` | S4: o diálogo renderiza durante a espera e o `allow` do hook fecha o diálogo |
-| **B: janela curta** | `tool.check` espera ≤ 8s por decisão no inbox; sem decisão → `next(e)` e o diálogo aparece | S4: o diálogo só aparece depois que o hook resolve |
-| **C: detecção + tecla** | Sem esperar no hook. `PermissionRequest` marca `tooluse` exato com `tool_use_id`; os botões da UI escrevem a tecla do diálogo no PTY | Sempre funciona; fallback de A e B |
+| **C: detecção + tecla** (default) | O `tool.check` devolve o `ask` na hora: o diálogo abre no terminal, e o manager recebe `PermissionAsk` com `tool_use_id` e resumo. Os botões do card escrevem a tecla do diálogo no PTY (`1` = sim, Esc = não) | Depende do layout do diálogo (opção 1 = Yes); valida só com `tooluse` ativo pro mesmo `tool_use_id` |
+| **R: modo remoto** (toggle por aba) | Com o toggle ligado, o `tool.check` segura o `ask` e faz long-poll em `/v1/permission` até a UI decidir; `allow`/`deny` voltam pelo hook, sem tecla. Terminal mostra `$.ui.status("aguardando aprovação no ClaudeManager")` | Quem está no terminal não consegue responder ali; o único escape é Esc, que aborta o turno |
 
-**Recomendação:** A se o S4 confirmar a corrida (melhor UX, sem custo pra quem olha o terminal). Senão C, não B: em B, quem olha o terminal espera 8s por nada.
+Recomendação: C como padrão e R como toggle "estou longe do terminal" (o caso real de aprovar pela UI). B (janela curta) foi descartada: faz quem olha o terminal esperar a janela por nada.
 
 Em qualquer variante:
-- Card na aba: tool, resumo curto (Bash: primeiros 200 chars do comando; Edit/Write: path; MCP: nome) só em memória, nunca persistido. Botões **Permitir uma vez** / **Negar** / **Responder no terminal**.
-- A decisão vale só pro `tool_use_id` exato; card velho (o tool_use já passou) some sozinho no `PostToolUse` / `Stop`.
+- Card na aba: tool, resumo curto (Bash: primeiros 200 chars do comando; Edit/Write: path; MCP: nome) só em memória, nunca persistido. Botões **Permitir uma vez** / **Negar** (+ **Responder no terminal** no modo R, que solta o `ask`).
+- A decisão vale só pro `tool_use_id` exato; card velho some sozinho no `PostToolUse` / `Stop`.
 - Sem `updatedPermissions` (sem "sempre permitir") na v1.
-- D11 fail-open e D12 só humano. Teste que prova que nenhuma rota do `agent_gateway` chega em `/v1/permission` nem no `Bridge.decide_permission`.
+- D11 fail-open: manager fora no modo R → devolve o `ask` (diálogo no terminal). D12 só humano: teste prova que nenhuma rota do `agent_gateway` chega em `/v1/permission` nem no `Bridge.decide_permission`.
 - Som e notificação: `_maybePlayStateSound` já dispara em `tooluse`; agora dispara no instante certo.
+- **Pendente S4b:** comportamento no modo `auto` (o padrão do usuário). Não rodei: o classificador do modo auto bloqueou eu subir um agente em modo auto. Teste manual: abrir uma aba com o spike, pedir um comando ambíguo e ver se o `ask` vira diálogo ou se o classificador resolve.
 
 ---
 
-## 8. Resultados dos spikes
+## 8. Resultados dos spikes (2026-10-19, Claude Code 2.1.303)
 
-_(preencher na Fase 0)_
+Spike reproduzível em `Docs/plans/2026-10-19-ClaudeManagerMod-spike/` (mod `cm-spike`, `driver.py` com servidor eco + `claude` num PTY real via pywinpty, `run_all.py`). Modelo haiku, `--permission-mode default`.
 
 | Spike | Resultado | Decisão tomada |
 |---|---|---|
-| S1 | | |
-| S2 | | |
-| S3 | | |
-| S4 | | |
-| S5 | | |
-| S6 | | |
-| S7 | | |
+| S1 | Append em `CLAUDE_CODE_PLUGIN_DIRS` no env do PTY: mod **não carrega** (o `env` do `~/.claude/settings.json` sobrescreve; o mod via `$.env.get` só via o harness-band). `--plugin-dir`: carrega, harness-band continua, sem prompt de hot reload. `hello` 8.4s após o spawn (sessão nova). `--resume` não medido (o projeto do spike não guardou transcript) | D5 → `--plugin-dir`; D7 timeout default 30s |
+| S2 | `$.env.get` lê as vars da aba; `$.http.fetch` pra `127.0.0.1` com header custom funciona; `$.session.version()` = 2.1.303 | D1, D2, D4 confirmados |
+| S3 | `classic.*` **nunca dispara** (instalação gerenciada pela org; o validate avisa). Nativos disparam: `turn.start`, `prompt.submit`, `tool.check`, `tool.call`, `turn.complete`, `session.end`, `session.measure`. `/clear`: só `session.end`, sem `session.start`; o id novo aparece em `$.session.id()` no turno seguinte | D9 → tradução de nativos (T2.1) |
+| S4 | Diálogo só depois do `tool.check` resolver; `allow` do hook roda sem diálogo; `deny` vira erro; Esc na espera aborta o hook e o turno | Item 3 → C + toggle R |
+| S5 | Long-poll de 20s em timer encadeado: 6+ ciclos, `waitedMs` ~20000, 0 erros, nenhuma linha de hook recusado | D3 confirmado |
+| S6 | Texto chega inteiro (multi-linha, unicode, 20KB); espera o turno livre (`queued_until_idle`); o modelo lê o wrapper "The cm-spike plugin sent a message: …"; depois de um Esc, o submit volta `drop` até a pessoa digitar; o `prompt.submit` do próprio plugin não vê o próprio submit | Composer fica no PTY; Hermes vai pro inbox com estado `dropped` |
+| S7 | `$.session.usage()`: `{startedAt, context{tokens,window,percent}, rateLimits[{kind,percentUsed,resetsAt}], cost{usd}}`; `session.measure` frequente | Throttle de 5s |
+| S4b | Não rodado (modo auto bloqueado pelo classificador pra agente) | Teste manual pendente |
 
 ---
 
 ## 9. Ordem, gates e rollback
 
-1. Fase 0 (spikes) → gate S1/S2/S3.
+1. Fase 0 (spikes): feita, gate passou (S1 via `--plugin-dir`, S2 ok, S3 via eventos nativos). Falta o S4b manual.
 2. Fase 1 + Fase 2 juntas (o transporte sem consumidor não se prova) → liga `claude_mod.enabled` só numa aba de teste. Critério: uma semana sem aba presa em estado errado; o Hermes recebe o mesmo número de `task_completed` que antes.
 3. Fase 3 (barata, mesmo transporte).
 4. Fase 4.
-5. Fase 5 (variante definida pelo S4).
+5. Fase 5 (variante C + toggle R).
 6. Opcional depois: push em vez do poll de 2s (`window.evaluate_js` direto quando chega um evento), pra transição instantânea.
 
 Gates por tarefa: manager → todos os `tests/*_check.py` e `tests/*.test.js` passando; mod → `claude plugin validate` + `tsc -p` + `claude plugin test`. Smoke manual no fim de cada fase: abrir aba, prompt, tool com permissão, `/clear`, `/resume`, restart da aba, fechar a aba.
@@ -199,4 +221,5 @@ Rollback: `claude_mod.enabled = false` volta tudo pro caminho atual (hooks `--se
 | Mod trava a sessão | Todo hook faz `next(e)` primeiro e só depois o fetch, com timeout de 2s e erro engolido. Nenhum hook decide nada fora do item 3 |
 | Prompt duplicado | `$.state.submitted` + nunca re-entregar automaticamente |
 | Vazamento de dado de tool | Payload sem input/prompt; resumo de permissão só em memória e truncado |
-| Abas dobram o trabalho do watch de mods do usuário | Medir no S1: custo de carregar 2 mods em N abas |
+| Abas dobram o trabalho do watch de mods do usuário | Cada aba carrega 2 mods (harness-band + bridge); medir RAM/CPU com 6 abas no smoke da Fase 1 |
+| Organização muda a política de plugins | Os eventos nativos usados não têm a restrição dos `classic.*`; `hello` reporta a versão; fallback do D7 |
