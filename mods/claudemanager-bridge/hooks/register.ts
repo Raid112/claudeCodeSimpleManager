@@ -13,6 +13,8 @@ const USAGE_EVERY_MS = 5000
 // classifier or the mode often lets the call run with no dialog. So an `ask` is
 // reported only if the call is still held this long after it; one the mode settles
 // sooner never flashes `tooluse` (no composer block, no chime, no Hermes wake-up).
+// The classifier often holds a call far longer than this, so the manager applies
+// the ask only once the tab has drawn a dialog (PtyManager.on_event).
 const ASK_GRACE_MS = 3000
 
 let sessionId = ''

@@ -187,15 +187,31 @@ def main() -> int:
         sid = s.claude_session_id
         post(bridge.url, "/v1/event", {"seq": 1, "event": "UserPromptSubmit", "session_id": sid}, token)
         check("5 UserPromptSubmit -> running", row()["state"] == "running")
-        post(bridge.url, "/v1/event", {"seq": 2, "event": "PermissionAsk", "session_id": sid, "tool_name": "Bash"}, token)
-        check("5 PermissionAsk -> tooluse", row()["state"] == "tooluse")
-        post(bridge.url, "/v1/event", {"seq": 4, "event": "Stop", "session_id": sid, "aborted": True}, token)
+        def prints(text):
+            s.pty.read = lambda: text
+            s.read()
+            s.pty.read = lambda: ""
+
+        # A dialog an earlier call drew must not confirm a later call's ask.
+        prints("\x1b[2GDo\x1b[5Gyou\x1b[9Gwant\x1b[14Gto\x1b[17Gproceed?\r\n\x1b[2GEsc\x1b[6Gto\x1b[9Gcancel")
+        post(bridge.url, "/v1/event", {"seq": 2, "event": "PreToolUse", "session_id": sid, "tool_name": "Bash", "tool_use_id": "tu-auto"}, token)
+        prints("\x1b[38;2;1;2;3m* Concocting… (3s)\x1b[39m\r\n")
+        post(bridge.url, "/v1/event", {"seq": 3, "event": "PermissionAsk", "session_id": sid, "tool_name": "Bash", "tool_use_id": "tu-auto"}, token)
+        check("5 an ask with no dialog drawn (auto classifier) stays running", row()["state"] == "running", str(row()["state"]))
+        post(bridge.url, "/v1/event", {"seq": 4, "event": "PostToolUse", "session_id": sid, "tool_name": "Bash", "tool_use_id": "tu-auto"}, token)
+        post(bridge.url, "/v1/event", {"seq": 5, "event": "PreToolUse", "session_id": sid, "tool_name": "Bash", "tool_use_id": "tu-1"}, token)
+        # claude 2.1.304 draws the dialog's spaces as cursor-column jumps.
+        prints("\x1b[2GDo\x1b[5Gyou\x1b[9Gwant\x1b[14Gto\x1b[17Gproceed?\r\n\x1b[2G❯\x1b[4G1.\x1b[7GYes")
+        post(bridge.url, "/v1/event", {"seq": 6, "event": "PermissionAsk", "session_id": sid, "tool_name": "Bash", "tool_use_id": "tu-1"}, token)
+        check("5 PermissionAsk with the dialog drawn -> tooluse", row()["state"] == "tooluse")
+        post(bridge.url, "/v1/event", {"seq": 8, "event": "Stop", "session_id": sid, "aborted": True}, token)
         r = row()
         check("5 Stop with aborted -> ready + flag", r["state"] == "ready" and r["state_flags"] == {"aborted": True}, str(r))
-        post(bridge.url, "/v1/event", {"seq": 3, "event": "PreToolUse", "session_id": sid, "tool_name": "Bash"}, token)
+        post(bridge.url, "/v1/event", {"seq": 7, "event": "PreToolUse", "session_id": sid, "tool_name": "Bash"}, token)
         check("5 a late (older seq) event does not move status back", row()["state"] == "ready")
         logged = [e["event"] for e in work_items.read_events() if e.get("session_key") == s.session_key]
-        check("5 ...but it is still in the event log", logged == ["UserPromptSubmit", "PermissionAsk", "Stop", "PreToolUse"], str(logged))
+        check("5 ...but it is still in the event log (the unconfirmed ask is not)",
+              logged == ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PreToolUse", "PermissionAsk", "Stop", "PreToolUse"], str(logged))
         check("5 unknown event is refused", post(bridge.url, "/v1/event", {"seq": 9, "event": "Rm", "session_id": sid}, token) == 500)
 
         post(bridge.url, "/v1/event", {"seq": 10, "event": "UserPromptSubmit", "session_id": "swapped-id"}, token)

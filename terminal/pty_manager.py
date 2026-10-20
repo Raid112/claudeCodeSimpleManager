@@ -9,6 +9,7 @@ which `get_all_sessions` reads back. There is no longer any need to poll the
 """
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -40,6 +41,21 @@ MOD_EVENTS = frozenset({
     "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "StopFailure",
     "PermissionAsk", "SessionEnd",
 })
+
+# The mod's PermissionAsk only says tool.check answered `ask` and the call was still
+# held a few seconds later. Under `auto` the classifier routinely holds it 5-30s with
+# no dialog, so the ask counts only if the tab actually drew a permission dialog.
+# Bash/Edit/MCP ("Do you want to ..."), AskUserQuestion and ExitPlanMode all end in
+# "Esc to cancel". claude 2.1.304 separates the words with cursor-column jumps
+# (ESC[nG), not spaces, so those become spaces before matching.
+_DIALOG_RE = re.compile(r"Do you want to|Would you like to proceed|Esc to cancel|❯\s*1\.\s*Yes")
+_CURSOR_COL_RE = re.compile(r"\x1b\[\d*[GC]")
+_ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b.")
+OUTPUT_TAIL = 16384
+
+
+def shows_permission_dialog(output: str) -> bool:
+    return bool(_DIALOG_RE.search(_ANSI_RE.sub("", _CURSOR_COL_RE.sub(" ", output))))
 
 
 def build_child_env(base: dict, tab_id: str, session_key: str, extra: dict | None = None) -> str:
@@ -134,6 +150,12 @@ class PtySession:
         self.pty = self._spawn(cols, rows, continue_session, resume)
 
     def _spawn(self, cols: int, rows: int, continue_session: bool, resume: bool):
+        # What the process printed lately, and how much it printed before each open
+        # tool call (by tool_use_id), so a PermissionAsk is checked against the
+        # output of its own call only, never a dialog an earlier call drew.
+        self._out_tail = ""
+        self._out_total = 0
+        self._tool_marks: dict[str, int] = {}
         pty = winpty.PTY(cols, rows)
         extra_env = None
         if self.mode == "mod":
@@ -210,9 +232,29 @@ class PtySession:
 
     def read(self) -> str:
         try:
-            return self.pty.read()
+            data = self.pty.read()
         except Exception:
             return ""
+        if data:
+            self._out_total += len(data)
+            self._out_tail = (self._out_tail + data)[-OUTPUT_TAIL:]
+        return data
+
+    def track_tool(self, event: str, tool_use_id: str | None) -> None:
+        if event == "PreToolUse" and tool_use_id:
+            self._tool_marks[tool_use_id] = self._out_total
+        elif event == "PostToolUse" and tool_use_id:
+            self._tool_marks.pop(tool_use_id, None)
+        elif event in ("Stop", "StopFailure", "SessionEnd"):
+            self._tool_marks.clear()
+
+    def permission_dialog_shown(self, tool_use_id: str | None) -> bool:
+        tail = self._out_tail
+        mark = self._tool_marks.get(tool_use_id) if tool_use_id else None
+        if mark is None:
+            return shows_permission_dialog(tail[-4096:])
+        since = self._out_total - mark
+        return since > 0 and shows_permission_dialog(tail[-since:])
 
     def write(self, data: str):
         try:
@@ -379,6 +421,14 @@ class PtyManager:
         if event not in MOD_EVENTS or not isinstance(session_id, str) or not session_id:
             raise ValueError("bad event")
         tool = body.get("tool_name")
+        tool_use_id = body.get("tool_use_id") if isinstance(body.get("tool_use_id"), str) else None
+        session.track_tool(event, tool_use_id)
+        if event == "PermissionAsk" and not session.permission_dialog_shown(tool_use_id):
+            # The mode (auto classifier) is still deciding; nobody is being asked.
+            # Not logged either: the event log feeds Hermes' permission_requested.
+            ui_log.log("mod.ask.unconfirmed", src="py", session=session.id,
+                       tool=tool if isinstance(tool, str) else None)
+            return
         write_event(
             session_id, event,
             tool_name=tool if isinstance(tool, str) else None,

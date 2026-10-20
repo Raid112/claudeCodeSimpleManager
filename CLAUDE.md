@@ -71,7 +71,7 @@ python tests/ui_log_check.py
 
 14. **terminal/ui_log.py + web/js/uilog.js** — Diagnostics log at `%LOCALAPPDATA%\ClaudeManager\logs\ui-YYYY-MM-DD.jsonl` (7 days). The frontend batches events (2s/50) through `Bridge.ui_log`; `PtySession.resize` writes from the Python side into the same file. Logged: `fit`/`fit.suspect` (geometry, container box, active/hidden), `resize.sent`/`resize.dropped`, `pty.resize`/`pty.resize.failed`, `ws.*`, `js.error`, `js.rejection`, window focus/visibility. This is the trail for the "terminal layout breaks until I switch tabs" bug. DevTools no longer opens on launch (set `CLAUDEMANAGER_DEBUG=1` for that); the 🩺 logs button in the title bar opens the folder.
 
-15. **terminal/mod_bridge.py + mods/claudemanager-bridge/** — Claude Code mod path (opt-in: `config.json` → `"claude_mod": {"enabled": true, "hello_timeout_s": 30}`, app restart). A claude tab then spawns with `--plugin-dir mods/claudemanager-bridge` and **without** the `--settings` hooks; the mod translates native engine events (`turn.start` → UserPromptSubmit, `tool.call` → Pre/PostToolUse, `tool.check` ask → PermissionAsk, `turn.complete` → Stop/StopFailure, `session.end` → SessionEnd) and POSTs them to `ModBridgeServer` (loopback, `127.0.0.1:0`, one token per tab in `X-CM-Tab-Token`, injected as `CLAUDEMANAGER_BRIDGE_URL/TOKEN`). `PtyManager.on_event` feeds the same `hook_state.write_event`, so `_derive_status`, the event log and the Hermes publisher are unchanged. `get_terminals()` adds `mod_state` (`pending`/`alive`/`missing`), `state_flags` and `usage` (context, rate limits, cost). A tab whose mod never says hello shows a "mod off" badge that restarts it in hooks mode (`restart_terminal(..., mode="hooks")`). Mod gates: `claude plugin validate mods/claudemanager-bridge`, `claude plugin test mods/claudemanager-bridge`, `npx -p typescript tsc -p mods/claudemanager-bridge` (num clone novo o `tsc` só funciona depois que o engine carregou o mod uma vez e escreveu `.claude-plugin/types/`). `PermissionAsk` só sai se a tool continuar parada 3s depois do `ask`: no modo `auto` o classificador decide depois do `tool.check`.
+15. **terminal/mod_bridge.py + mods/claudemanager-bridge/** — Claude Code mod path (opt-in: `config.json` → `"claude_mod": {"enabled": true, "hello_timeout_s": 30}`, app restart). A claude tab then spawns with `--plugin-dir mods/claudemanager-bridge` and **without** the `--settings` hooks; the mod translates native engine events (`turn.start` → UserPromptSubmit, `tool.call` → Pre/PostToolUse, `tool.check` ask → PermissionAsk, `turn.complete` → Stop/StopFailure, `session.end` → SessionEnd) and POSTs them to `ModBridgeServer` (loopback, `127.0.0.1:0`, one token per tab in `X-CM-Tab-Token`, injected as `CLAUDEMANAGER_BRIDGE_URL/TOKEN`). `PtyManager.on_event` feeds the same `hook_state.write_event`, so `_derive_status`, the event log and the Hermes publisher are unchanged. `get_terminals()` adds `mod_state` (`pending`/`alive`/`missing`), `state_flags` and `usage` (context, rate limits, cost). A tab whose mod never says hello shows a "mod off" badge that restarts it in hooks mode (`restart_terminal(..., mode="hooks")`). Details, status rules and debugging: section **Claude Code mod** below.
 
 **Data flow:** User input → xterm.js → WebSocket → pywinpty → Claude CLI → pywinpty → WebSocket → xterm.js
 
@@ -86,14 +86,41 @@ python tests/ui_log_check.py
 - **web/vendor/**: Contains vendored xterm.js libraries (minified). Do not modify.
 - **No framework**: Frontend is vanilla JS with no build step, no bundler, no npm.
 
-## Claude Code mod (em andamento)
+## Claude Code mod
 
-Plano: `Docs/plans/2026-10-19-ClaudeManagerMod.md`. Abas claude passam a carregar um mod do Claude Code que fala com o manager de dentro da sessão (estado exato, prompt sem PTY, aprovação de tool pela UI, uso por aba), no lugar dos hooks `--settings` + heurística de output.
+**Caminho principal das abas claude** (ligado no `config.json` do Caio: `claude_mod.enabled = true`). É o que decide a cor da aba, o som, o toast e o que o Hermes recebe, então mudança aqui é de alto impacto: rode os gates e confira contra uma sessão real antes de dar por pronto. Plano: `Docs/plans/2026-10-19-ClaudeManagerMod.md`. O mod fala com o manager de dentro da sessão (estado exato, uso por aba; prompt sem PTY e aprovação pela UI ainda são plano), no lugar dos hooks `--settings` + heurística de output.
+
+### Como o status sai
+
+| Evento nativo (mod) | Evento enviado | Status |
+|---|---|---|
+| `turn.start` (loop principal) | `UserPromptSubmit` | `running` |
+| `tool.call` início / fim (inclui subagente) | `PreToolUse` / `PostToolUse` | `running` |
+| `tool.check` = `ask`, tool ainda parada 3s depois | `PermissionAsk` | `tooluse` (amarelo), **só se o manager confirmar** |
+| `turn.complete` (loop principal) | `Stop` / `StopFailure` | `ready` |
+| `session.end` | `SessionEnd` | inalterado |
+
+- **`PermissionAsk` tem duas travas.** (1) Mod: grace de 3s (`ASK_GRACE_MS` em `register.ts`), porque `tool.check` roda antes do modo decidir. (2) Manager: `PtyManager.on_event` só aplica se a saída do PTY desde o `PreToolUse` daquele `tool_use_id` desenhou um diálogo (`shows_permission_dialog`). A trava 2 existe porque no modo `auto` (o default do Caio) o classificador segura a tool 5-30s sem diálogo nenhum: só com a grace, toda Bash ficava amarela, tocava som e acordava o Hermes. `PermissionAsk` não confirmado não muda estado nem entra no event log (o Hermes lê dali), só gera `mod.ask.unconfirmed` no ui log.
+- **Limite conhecido:** o `PermissionAsk` sai uma vez só. Um diálogo que aparece depois dele (o auto desistindo e perguntando) não acende amarelo. Se isso morder, o conserto é o mod reenviar o ask enquanto ele estiver pendente.
+- **Sem `waiting` (roxo) no modo mod:** não há `Notification(idle_prompt)` nativo. Com `mod_state === "alive"`, o `terminal.js` usa só o `backendState`, sem as correções por output.
+- **A API não expõe o modo de permissão efetivo** nem um evento de "diálogo aberto" (o diálogo de permissão não é `RenderComponent`; `decider` só diz `host`/`person`; `ui.notify` é só de plugin). Por isso a confirmação é pela saída do PTY. Não gaste tempo procurando de novo sem um build novo.
+- **O TUI separa palavras com `ESC[nG` (pula pra coluna), não com espaço.** Regex sobre a saída crua tem que trocar `ESC[nG`/`ESC[nC` por espaço antes (feito em `shows_permission_dialog`). O `_classifyIdleStatus` do frontend (abas sem mod) ainda não faz isso, e por isso não reconhece o diálogo.
+
+### Diagnosticar status errado
+
+1. Estado atual por aba: `%LOCALAPPDATA%\ClaudeManager\state\<tab_id>.json` (`event`, `status`, `ts`, `session_id`).
+2. Sequência de eventos: `%LOCALAPPDATA%\ClaudeManager\events\events-YYYY-MM-DD-<session_key>.jsonl` (o `session_key` está no state). Imprimir `ts`, delta, `event`, `tool` das últimas linhas mostra o padrão na hora (foi assim que o bug do amarelo apareceu: `PermissionAsk` 4-12s depois de cada `PreToolUse` de Bash).
+3. `%LOCALAPPDATA%\ClaudeManager\logs\ui-*.jsonl`: `mod.ask.unconfirmed`, `pty.*`, `ws.*`.
+4. Pra ver o que o TUI desenha de verdade, capture um `claude` num PTY descartável: `winpty.PtyProcess.spawn("claude --permission-mode <modo>", cwd=<dir já confiado>, env=<env sem CLAUDE_CODE_*/CLAUDECODE/CLAUDEMANAGER*>)`. Detalhes que custaram tentativas: `pty.read()` bloqueia (leia numa thread); espere ~25s pelo boot; submeta com `prepare_composer_message(texto, bracketed_paste_mode=True, provider="claude")` e, se não entrar, mande `\r` depois; um dir novo trava no diálogo de trust. Um `mkdir "$TEMP/x"` força diálogo no modo `default` e passa pelo classificador no `auto`.
+
+### Regras
 
 - **O mod mora neste repo:** `mods/claudemanager-bridge/` (decidido; não criar em `~/.claude/dev-mods` nem em `clones/.claude/mods`). O `pty_manager` carrega ele com `--plugin-dir` no comando da aba. Append em `CLAUDE_CODE_PLUGIN_DIRS` no env **não funciona**: o `env` do `~/.claude/settings.json` sobrescreve (spike S1).
 - **Lado manager:** `terminal/mod_bridge.py` (HTTP loopback com token por aba). Separado do `agent_gateway`: Hermes nunca aprova tool.
 - **Exclusivo:** aba em modo mod sobe sem o `--settings` do manager (os dois juntos duplicam eventos). Flag `config.json` → `claude_mod.enabled`; desligada = caminho atual.
-- **API de mods muda por build:** referência 2.1.303. O engine reescreve `mods/claudemanager-bridge/.claude-plugin/types/` a cada load (gitignored: inclui a lista de MCPs do usuário); o `hello` do mod manda `engine_version`. Gates do mod: `claude plugin validate`, `tsc -p`, `claude plugin test`.
+- **API de mods muda por build:** escrito contra 2.1.303; em 2026-10-20 a instalação já roda 2.1.304. O engine reescreve `mods/claudemanager-bridge/.claude-plugin/types/` a cada load (gitignored: inclui a lista de MCPs do usuário), então a referência da API é sempre o `index.d.ts` de lá; o `hello` do mod manda `engine_version`. Gates do mod: `claude plugin validate mods/claudemanager-bridge`, `claude plugin test mods/claudemanager-bridge`, `npx -p typescript tsc -p mods/claudemanager-bridge` (num clone novo o `tsc` só funciona depois que o engine carregou o mod uma vez). Lado manager: `python tests/mod_bridge_check.py`.
+- **Teste de dentro de uma aba mod:** a sessão herda `CLAUDEMANAGER_BRIDGE_URL/TOKEN`, e dois checks do `mod_bridge_check.py` falham por isso. Rode com `env -u CLAUDEMANAGER_BRIDGE_TOKEN -u CLAUDEMANAGER_BRIDGE_URL`.
+- **Mudança no lado Python só vale depois de reiniciar o app.** Se `CLAUDEMANAGER_TAB` está no env, reiniciar mata a própria sessão: peça pro Caio reiniciar. Mudança no mod vale pra abas abertas depois (ou reiniciadas).
 - **Teste de ponta a ponta rodado de dentro de uma sessão Claude Code:** limpar `CLAUDE_CODE_*`/`CLAUDECODE` do env antes de spawnar, senão a aba filha herda `CLAUDE_CODE_CHILD_SESSION=1`, não grava transcript e o `--resume` falha.
 - **Só eventos nativos** (`turn.*`, `tool.call`, `tool.check`, `session.*`): hooks `classic.*` não disparam nesta instalação (Claude Code gerenciado pela organização). Tradução pro vocabulário do `hook_state` na seção 4 do plano.
 - Codex/opencode/powershell não mudam (seguem PTY + heurística).
