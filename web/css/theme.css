@@ -386,7 +386,6 @@ body.col-resizing {
     background: var(--status-waiting);
     border-color: var(--status-waiting);
     box-shadow: 0 0 8px var(--status-waiting), 0 0 16px rgba(192, 132, 252, 0.4);
-    animation: tooluse-pulse 1.5s ease-in-out infinite;
 }
 .terminal-dot.stopped {
     background: var(--status-stopped);
@@ -583,11 +582,9 @@ body.col-resizing {
     border-color: var(--status-ready);
     box-shadow: 0 0 6px var(--status-ready), 0 0 14px rgba(0, 255, 136, 0.3);
 }
-/* A ready session in a background tab pulses to grab attention; the pulse
-   stops once the tab is active (user has looked at it). */
-.tab:not(.active) .tab-dot.ready {
-    animation: tooluse-pulse 1.5s ease-in-out infinite;
-}
+/* A ready session in a background tab is marked by the underline alone. It does
+   not pulse: an idle tab is the normal state, and endless motion keeps the
+   WebView producing frames for as long as the window is on screen. */
 .tab:not(.active).status-ready {
     box-shadow: inset 0 -2px 0 var(--status-ready);
 }
@@ -601,7 +598,6 @@ body.col-resizing {
     background: var(--status-waiting);
     border-color: var(--status-waiting);
     box-shadow: 0 0 6px var(--status-waiting), 0 0 14px rgba(192, 132, 252, 0.3);
-    animation: tooluse-pulse 1.5s ease-in-out infinite;
 }
 .tab .tab-dot.stopped {
     background: var(--status-stopped);
@@ -632,18 +628,12 @@ body.col-resizing {
     color: var(--danger);
     border-color: rgba(239, 68, 68, 0.5);
     box-shadow: 0 0 6px rgba(239, 68, 68, 0.3);
-    animation: cache-pulse 1.8s ease-in-out infinite;
 }
 .cache-timer.expired {
     color: var(--text-dim);
     border-color: var(--border-dim);
     text-decoration: line-through;
     opacity: 0.7;
-}
-
-@keyframes cache-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.55; }
 }
 
 .tab .tab-close {
@@ -1137,25 +1127,23 @@ body.col-resizing {
   transition:color var(--ease),background-color var(--ease)}
 .addSess:hover{color:#fff;background:var(--bg-hover)}
 
-/* status dots — motion grammar per state */
+/* status dots — color per state. Only tooluse moves: a permission ask needs the user
+   now, while the other states last for hours and would animate all day */
 .d-ready{background:var(--status-ready);box-shadow:0 0 6px var(--status-ready)}
-.d-waiting{background:var(--status-waiting);box-shadow:0 0 6px var(--status-waiting);animation:wiBlink 2.6s ease-in-out infinite}
+.d-waiting{background:var(--status-waiting);box-shadow:0 0 6px var(--status-waiting)}
 .d-tooluse{position:relative;background:var(--status-tooluse);box-shadow:0 0 5px var(--status-tooluse)}
 .d-tooluse::after{content:"";position:absolute;inset:-3px;border-radius:50%;border:1px solid transparent;
   border-top-color:var(--status-tooluse);animation:wiSpin .9s linear infinite}
-.d-active{background:var(--status-active);box-shadow:0 0 6px var(--status-active);animation:wiBreathe 2.4s ease-in-out infinite}
+.d-active{background:var(--status-active);box-shadow:0 0 6px var(--status-active)}
 .d-stopped{background:var(--status-stopped)}
-@keyframes wiBreathe{0%,100%{opacity:.75}50%{opacity:1;box-shadow:0 0 9px var(--status-active)}}
-@keyframes wiBlink{0%,42%,100%{opacity:1}12%,30%{opacity:.25}}
 @keyframes wiSpin{to{transform:rotate(360deg)}}
-@media (prefers-reduced-motion:reduce){.d-waiting,.d-tooluse::after,.d-active,.wi.has-running::before{animation:none!important}}
+@media (prefers-reduced-motion:reduce){.d-tooluse::after{animation:none!important}}
 
 /* running filament down the card edge */
 .wi.has-running{border-left-color:transparent}
 .wi.has-running::before{content:"";position:absolute;left:-3px;top:0;bottom:0;width:3px;
-  background:linear-gradient(180deg,var(--c),#fff 45%,var(--c) 70%,var(--c));background-size:100% 260%;
-  animation:wiFlow 2s linear infinite;box-shadow:0 0 7px color-mix(in srgb,var(--c) 55%,transparent)}
-@keyframes wiFlow{0%{background-position:0 130%}100%{background-position:0 -130%}}
+  background:linear-gradient(180deg,var(--c),#fff 45%,var(--c) 70%,var(--c));
+  box-shadow:0 0 7px color-mix(in srgb,var(--c) 55%,transparent)}
 
 /* nova aba chips */
 .chips{display:flex;flex-wrap:wrap;gap:5px;padding:2px 10px 12px}
