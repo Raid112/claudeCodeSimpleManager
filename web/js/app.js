@@ -177,7 +177,7 @@ class App {
         // Cache-timer tick — re-render tab bar each 15s so MM:SS counts down visibly
         // without coupling to the heavier 2s status poll.
         setInterval(() => {
-            if (Object.keys(this.terminals).length > 0) this.tabBar.render();
+            if (Object.keys(this.terminals).length > 0) this.tabBar.render({ onlyIfChanged: true });
         }, 15000);
 
         this._bindSidebarResize();
@@ -468,8 +468,8 @@ class App {
         if (this._isRenaming) return;
 
         // Always re-render to pick up ready/running transitions based on idle time
-        this.tabBar.render();
-        await this.sidebar.render();
+        this.tabBar.render({ onlyIfChanged: true });
+        await this.sidebar.render({ onlyIfChanged: true });
         if (this.composer) this.composer.refreshTarget();
     }
 

@@ -41,7 +41,7 @@ class TabBar {
         return nm ? nm.slice(0, 12) : 'TODO';   // o resto o CSS corta (.tab-stub tem max-width)
     }
 
-    render() {
+    render(opts = {}) {
         let html = '';
 
         // Gaveta: com um work item travado, só as abas DELE ficam expandidas; as outras viram
@@ -123,6 +123,11 @@ class TabBar {
             html += `</div>`;
         }
 
+        // The status poll calls this every 2 s. Rebuilding an identical DOM costs layout and
+        // paint and restarts every CSS animation, so the poll skips it. An explicit render()
+        // always rebuilds: callers use it to discard DOM they edited in place (rename input).
+        if (opts.onlyIfChanged && html === this._lastHtml) return;
+        this._lastHtml = html;
         this.container.innerHTML = html;
         this._bindEvents();
     }
@@ -298,4 +303,8 @@ class TabBar {
             });
         });
     }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { TabBar };
 }

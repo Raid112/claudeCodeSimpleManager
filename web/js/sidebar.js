@@ -144,7 +144,7 @@ class Sidebar {
     }
 
     // ---------- render ----------
-    async render() {
+    async render(opts = {}) {
         const groups = await window.pywebview.api.get_groups();
         try { this._terminalType = await window.pywebview.api.get_terminal_type(); } catch (e) {}
 
@@ -187,6 +187,9 @@ class Sidebar {
         html += this._renderAvulso(avulso);
         html += this._renderNovaAba(groups);
 
+        // Same rule as TabBar.render: the 2 s poll skips an identical rebuild.
+        if (opts.onlyIfChanged && html === this._lastHtml) return;
+        this._lastHtml = html;
         this.container.innerHTML = html;
         this._renderTypeSelector();
         this._bindEvents();
