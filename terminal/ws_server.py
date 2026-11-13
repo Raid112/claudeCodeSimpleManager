@@ -14,6 +14,18 @@ from terminal.input_debug import log_input_boundary, log_output_summary
 from terminal.pty_manager import PtyManager
 
 
+# An idle tab used to wake this loop every 10 ms forever. The delay now grows while reads keep
+# coming back empty and resets on the first byte: streaming output keeps the 10 ms pace, and the
+# cap bounds how late the first echo can be after the tab sat idle.
+IDLE_POLL_MIN = 0.01
+IDLE_POLL_MAX = 0.05
+
+
+def idle_poll_delay(empty_reads: int) -> float:
+    """Seconds to sleep after `empty_reads` consecutive empty PTY reads."""
+    return min(IDLE_POLL_MAX, IDLE_POLL_MIN * 2 ** min(empty_reads, 8))
+
+
 class WsCapabilityStore:
     """Short-lived, one-use capabilities bound to one managed PTY tab."""
 
@@ -234,6 +246,7 @@ class WebSocketServer:
     async def _pty_to_ws(self, session, websocket):
         """Read from PTY, send to WebSocket."""
         sum_start, sum_chunks, sum_chars = time.monotonic(), 0, 0
+        empty_reads = 0
         while True:
             try:
                 now = time.monotonic()
@@ -244,6 +257,7 @@ class WebSocketServer:
                     sum_start = now
                 data = session.read()
                 if data:
+                    empty_reads = 0
                     sum_chunks += 1
                     sum_chars += len(data)
                     log_input_boundary("pty->ws", data, session_id=session.id)
@@ -253,7 +267,8 @@ class WebSocketServer:
                     await websocket.close(1011, "PTY exited")
                     break
                 else:
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(idle_poll_delay(empty_reads))
+                    empty_reads += 1
             except Exception as exc:
                 print(f"[ws] session={session.id} PTY->WS stopped ({type(exc).__name__})")
                 break
